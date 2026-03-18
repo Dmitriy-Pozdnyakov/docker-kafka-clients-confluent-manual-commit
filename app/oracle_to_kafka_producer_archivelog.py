@@ -581,6 +581,7 @@ def run_once(cfg: Config) -> Dict[str, Any]:
     # 1) Загружаем состояние.
     state = _load_state(cfg)
     last_commit_scn = int(state.get("last_commit_scn", cfg.start_from_commit_scn))
+    from_commit_scn = last_commit_scn
     _log(
         cfg,
         (
@@ -722,6 +723,68 @@ def run_once(cfg: Config) -> Dict[str, Any]:
         else:
             _log(cfg, "no new rows, state not changed")
 
+        # 9) Сводные SCN-метрики батча.
+        # Нужны для быстрого ответа на вопросы:
+        # - какой диапазон SCN мы обработали;
+        # - есть ли прогресс state;
+        # - насколько отстаем от хвоста выбранного окна archived logs.
+        #
+        # from_commit_scn:
+        #   SCN из state ДО запуска батча (точка старта).
+        # to_commit_scn:
+        #   SCN в state ПОСЛЕ батча (точка окончания).
+        # processed_scn_span:
+        #   Насколько продвинулись за батч: to - from.
+        # logs_min_first_change / logs_max_next_change:
+        #   Границы SCN-окна по выбранным archived logs.
+        # lag_to_logs_tail_scn:
+        #   Приблизительное отставание от хвоста выбранного окна:
+        #   logs_max_next_change - to_commit_scn (если next_change доступен).
+        row_commit_scns = [int(r["commit_scn"]) for r in rows]
+        # Фактические границы commit_scn в самом батче (по реальным строкам).
+        first_batch_commit_scn = min(row_commit_scns) if row_commit_scns else None
+        last_batch_commit_scn = max(row_commit_scns) if row_commit_scns else None
+
+        # Границы SCN по выбранным archived logs.
+        log_first_changes = [int(item["first_change"]) for item in archived_logs if item.get("first_change") is not None]
+        log_next_changes = [int(item["next_change"]) for item in archived_logs if item.get("next_change") is not None]
+        logs_min_first_change = min(log_first_changes) if log_first_changes else None
+        logs_max_next_change = max(log_next_changes) if log_next_changes else None
+
+        # Основные итоговые индикаторы прогресса.
+        processed_scn_span = max(0, int(last_commit_scn) - int(from_commit_scn))
+        lag_to_logs_tail_scn = (
+            max(0, int(logs_max_next_change) - int(last_commit_scn))
+            if logs_max_next_change is not None
+            else None
+        )
+        state_advanced = int(last_commit_scn) > int(from_commit_scn)
+
+        # Единый объект метрик для лога и итогового result.
+        scn_metrics = {
+            "from_commit_scn": int(from_commit_scn),
+            "first_batch_commit_scn": first_batch_commit_scn,
+            "last_batch_commit_scn": last_batch_commit_scn,
+            "to_commit_scn": int(last_commit_scn),
+            "processed_scn_span": processed_scn_span,
+            "logs_min_first_change": logs_min_first_change,
+            "logs_max_next_change": logs_max_next_change,
+            "lag_to_logs_tail_scn": lag_to_logs_tail_scn,
+            "state_advanced": state_advanced,
+        }
+        # Короткая строка для оперативного просмотра в cron/docker логах.
+        _log(
+            cfg,
+            (
+                "scn summary "
+                f"(from={scn_metrics['from_commit_scn']}, "
+                f"to={scn_metrics['to_commit_scn']}, "
+                f"span={scn_metrics['processed_scn_span']}, "
+                f"lag_to_logs_tail={scn_metrics['lag_to_logs_tail_scn']}, "
+                f"state_advanced={scn_metrics['state_advanced']})"
+            ),
+        )
+
         timings["total_sec"] = time.monotonic() - t0
         result = {
             "rows": len(rows),
@@ -732,6 +795,7 @@ def run_once(cfg: Config) -> Dict[str, Any]:
             "last_commit_scn": last_commit_scn,
             "logs_used": logs,
             "topics_used": topics_used,
+            "scn_metrics": scn_metrics,
             "timings_sec": {k: round(v, 3) for k, v in timings.items()},
         }
         _log(cfg, f"batch finished: {result}")
