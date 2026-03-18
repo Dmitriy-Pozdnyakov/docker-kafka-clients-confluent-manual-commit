@@ -1,0 +1,34 @@
+services:
+  oracle-producer-archivelog:
+    build: .
+    mem_limit: ${ORACLE_PRODUCER_MEM_LIMIT:-512m}
+    cpus: ${ORACLE_PRODUCER_CPUS:-0.50}
+    env_file:
+      - ./env/oracle-producer-archivelog.env
+    command: ["python", "app/oracle_to_kafka_producer_archivelog.py"]
+    volumes:
+      - ./certs/ca.crt:/certs/ca.crt:ro
+      - ./state:/state
+    restart: "no"
+
+  producer:
+    build: .
+    mem_limit: ${PRODUCER_MEM_LIMIT:-256m}
+    cpus: ${PRODUCER_CPUS:-0.25}
+    env_file:
+      - ./env/producer.env
+    command: ["python", "app/producer.py"]
+    volumes:
+      - ./certs/ca.crt:/certs/ca.crt:ro
+    restart: unless-stopped
+
+  consumer:
+    build: .
+    mem_limit: ${CONSUMER_MEM_LIMIT:-256m}
+    cpus: ${CONSUMER_CPUS:-0.50}
+    env_file:
+      - ./env/consumer.env
+    command: ["python", "app/consumer.py"]
+    volumes:
+      - ./certs/ca.crt:/certs/ca.crt:ro
+    restart: unless-stopped
