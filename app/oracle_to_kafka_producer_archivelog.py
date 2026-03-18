@@ -71,6 +71,8 @@ class Config:
     filter_schemas: Tuple[str, ...] = ()  # список схем
     filter_tables: Tuple[str, ...] = ()  # список таблиц
     max_rows_per_batch: int = 5000  # максимум строк за один батч (0 = без лимита)
+    use_fetchmany: bool = True  # читать данные из курсора чанками (memory-friendly)
+    fetchmany_size: int = 1000  # размер чанка при use_fetchmany=true
 
     # =========================
     # Logging
@@ -156,6 +158,8 @@ def load_config_from_env() -> Config:
         filter_schemas=filter_schemas,
         filter_tables=filter_tables,
         max_rows_per_batch=int(os.getenv("MAX_ROWS_PER_BATCH", "5000")),
+        use_fetchmany=_str_to_bool(os.getenv("USE_FETCHMANY", "true"), True),
+        fetchmany_size=int(os.getenv("FETCHMANY_SIZE", "1000")),
         verbose=_str_to_bool(os.getenv("VERBOSE", "true"), True),
         log_first_n_events=int(os.getenv("LOG_FIRST_N_EVENTS", "3")),
     )
@@ -174,6 +178,8 @@ def validate_config(cfg: Config) -> None:
         missing.append("KAFKA_BROKER or BROKER")
     if missing:
         raise RuntimeError(f"Missing required env vars: {', '.join(missing)}")
+    if cfg.fetchmany_size <= 0:
+        raise RuntimeError("FETCHMANY_SIZE must be > 0")
 
 
 def _load_state(cfg: Config) -> Dict[str, int]:
@@ -394,13 +400,16 @@ def _start_logminer(cur: oracledb.Cursor, cfg: Config, log_files: List[str]) -> 
     )
 
 
-def _fetch_rows(
-    cur: oracledb.Cursor,
+def _build_fetch_rows_query(
     from_commit_scn: int,
     filter_schemas: Sequence[str],
     filter_tables: Sequence[str],
     max_rows_per_batch: int,
-) -> List[Dict[str, Any]]:
+) -> Tuple[str, Dict[str, Any]]:
+    # Эта функция только строит SQL + bind-параметры.
+    # Выполнение запроса вынесено в run_once(), чтобы можно было:
+    # - читать курсор потоково (fetchmany),
+    # - публиковать в Kafka "на лету", без накопления всего батча в памяти.
     # Базовый SQL: только DML после watermark commit_scn.
     base_sql = """
     SELECT
@@ -451,6 +460,10 @@ def _fetch_rows(
         # 3) возвращаем все строки с commit_scn <= cutoff_commit_scn.
         #
         # Итог: размер батча может быть чуть больше N, но commit всегда полный.
+        #
+        # Зачем это нужно:
+        # - если порезать commit посередине, в следующем батче можно получить
+        #   неконсистентный срез данных и сложнее делать дедупликацию/resume.
         sql = f"""
         WITH base_rows AS (
           {base_sql}
@@ -489,16 +502,16 @@ def _fetch_rows(
     else:
         sql = f"{base_sql}{order_by}"
 
-    cur.execute(sql, binds)
-    columns = [c[0].lower() for c in cur.description]
-    rows: List[Dict[str, Any]] = []
-    for record in cur:
-        row = dict(zip(columns, record))
-        ts = row.get("timestamp")
-        if isinstance(ts, datetime):
-            row["timestamp"] = ts.isoformat()
-        rows.append(row)
-    return rows
+    return sql, binds
+
+
+def _record_to_row(columns: Sequence[str], record: Sequence[Any]) -> Dict[str, Any]:
+    # Преобразуем строку Oracle в словарь и нормализуем timestamp для JSON.
+    row = dict(zip(columns, record))
+    ts = row.get("timestamp")
+    if isinstance(ts, datetime):
+        row["timestamp"] = ts.isoformat()
+    return row
 
 
 def _event_key(row: Dict[str, Any]) -> bytes:
@@ -590,11 +603,16 @@ def run_once(cfg: Config) -> Dict[str, Any]:
             f"base_topic={cfg.kafka_topic}, from_commit_scn={last_commit_scn}, "
             f"filter_schemas={','.join(merged_schemas) if merged_schemas else '*'}, "
             f"filter_tables={','.join(merged_tables) if merged_tables else '*'}, "
-            f"max_rows_per_batch={cfg.max_rows_per_batch})"
+            f"max_rows_per_batch={cfg.max_rows_per_batch}, "
+            f"use_fetchmany={cfg.use_fetchmany}, fetchmany_size={cfg.fetchmany_size})"
         ),
     )
 
     # 2) Инициализация producer и счетчиков.
+    # Счетчики держим здесь, чтобы собрать:
+    # - delivery-статистику Kafka,
+    # - метрики backpressure,
+    # - SCN-прогресс батча.
     producer = _build_kafka_producer(cfg)
     delivered = 0
     failed = 0
@@ -654,50 +672,136 @@ def run_once(cfg: Config) -> Dict[str, Any]:
         timings["start_logminer_sec"] = time.monotonic() - t_logminer
         _log(cfg, "LogMiner started")
 
-        # 5) Читаем строки из LogMiner.
-        t_fetch = time.monotonic()
-        rows = _fetch_rows(
-            cur=cur,
+        # 5) Готовим SQL для чтения строк из LogMiner.
+        # Важно: только подготовка SQL; само чтение будет потоковым ниже.
+        t_prepare_fetch = time.monotonic()
+        sql, binds = _build_fetch_rows_query(
             from_commit_scn=last_commit_scn,
             filter_schemas=merged_schemas,
             filter_tables=merged_tables,
             max_rows_per_batch=cfg.max_rows_per_batch,
         )
-        timings["fetch_rows_sec"] = time.monotonic() - t_fetch
-        _log(cfg, f"rows fetched from v$logmnr_contents: {len(rows)}")
+        timings["prepare_fetch_cursor_sec"] = time.monotonic() - t_prepare_fetch
 
-        # 6) Публикуем в Kafka.
-        t_publish = time.monotonic()
-        for idx, row in enumerate(rows):
-            value = json.dumps(row, ensure_ascii=False).encode("utf-8")
-            topic = _resolve_topic(cfg, row)
-            retries, waited = _produce_with_backpressure(
-                cfg=cfg,
-                producer=producer,
-                topic=topic,
-                key=_event_key(row),
-                value=value,
-                callback=on_delivery,
-            )
-            queue_full_retries += retries
-            queue_full_wait_sec += waited
-            topics_used[topic] = topics_used.get(topic, 0) + 1
-            producer.poll(0)
+        # 6) Читаем и публикуем потоково.
+        #
+        # use_fetchmany=true:
+        #   читаем курсор чанками, не держим весь батч в памяти.
+        # use_fetchmany=false:
+        #   читаем cur.fetchall() (legacy-поведение).
+        t_fetch_total = 0.0
+        t_publish_total = 0.0
+        rows_count = 0
+        first_batch_commit_scn: Optional[int] = None
+        last_batch_commit_scn: Optional[int] = None
 
-            if idx < cfg.log_first_n_events:
-                _log(
-                    cfg,
-                    (
-                        "queued event "
-                        f"topic={topic} "
-                        f"commit_scn={row.get('commit_scn')} "
-                        f"schema={row.get('seg_owner')} table={row.get('table_name')} "
-                        f"operation={row.get('operation')}"
-                    ),
+        cur.execute(sql, binds)
+        columns = [c[0].lower() for c in cur.description]
+
+        if cfg.use_fetchmany:
+            _log(cfg, f"fetch mode=fetchmany, fetchmany_size={cfg.fetchmany_size}")
+            while True:
+                # Каждый fetchmany возвращает ограниченный кусок строк,
+                # что стабилизирует память при больших батчах/широких SQL_REDO.
+                t_fetch_chunk = time.monotonic()
+                records = cur.fetchmany(cfg.fetchmany_size)
+                t_fetch_total += time.monotonic() - t_fetch_chunk
+                if not records:
+                    break
+
+                for record in records:
+                    # Нормализуем строку Oracle -> dict и сразу публикуем.
+                    # Таким образом, в Python не накапливается весь батч целиком.
+                    row = _record_to_row(columns, record)
+                    rows_count += 1
+                    commit_scn = int(row["commit_scn"])
+                    if first_batch_commit_scn is None:
+                        first_batch_commit_scn = commit_scn
+                    last_batch_commit_scn = commit_scn
+
+                    t_publish_one = time.monotonic()
+                    value = json.dumps(row, ensure_ascii=False).encode("utf-8")
+                    topic = _resolve_topic(cfg, row)
+                    retries, waited = _produce_with_backpressure(
+                        cfg=cfg,
+                        producer=producer,
+                        topic=topic,
+                        key=_event_key(row),
+                        value=value,
+                        callback=on_delivery,
+                    )
+                    t_publish_total += time.monotonic() - t_publish_one
+
+                    queue_full_retries += retries
+                    queue_full_wait_sec += waited
+                    topics_used[topic] = topics_used.get(topic, 0) + 1
+                    # producer.poll(0) обслуживает callback delivery без блокировки.
+                    producer.poll(0)
+
+                    if rows_count <= cfg.log_first_n_events:
+                        _log(
+                            cfg,
+                            (
+                                "queued event "
+                                f"topic={topic} "
+                                f"commit_scn={row.get('commit_scn')} "
+                                f"schema={row.get('seg_owner')} table={row.get('table_name')} "
+                                f"operation={row.get('operation')}"
+                            ),
+                        )
+        else:
+            _log(cfg, "fetch mode=fetchall (legacy)")
+            # Legacy-режим оставлен как feature-flag для быстрого отката поведения.
+            t_fetch_all = time.monotonic()
+            records = cur.fetchall()
+            t_fetch_total += time.monotonic() - t_fetch_all
+
+            for record in records:
+                row = _record_to_row(columns, record)
+                rows_count += 1
+                commit_scn = int(row["commit_scn"])
+                if first_batch_commit_scn is None:
+                    first_batch_commit_scn = commit_scn
+                last_batch_commit_scn = commit_scn
+
+                t_publish_one = time.monotonic()
+                value = json.dumps(row, ensure_ascii=False).encode("utf-8")
+                topic = _resolve_topic(cfg, row)
+                retries, waited = _produce_with_backpressure(
+                    cfg=cfg,
+                    producer=producer,
+                    topic=topic,
+                    key=_event_key(row),
+                    value=value,
+                    callback=on_delivery,
                 )
-        timings["publish_rows_sec"] = time.monotonic() - t_publish
+                t_publish_total += time.monotonic() - t_publish_one
+
+                queue_full_retries += retries
+                queue_full_wait_sec += waited
+                topics_used[topic] = topics_used.get(topic, 0) + 1
+                # producer.poll(0) обслуживает callback delivery без блокировки.
+                producer.poll(0)
+
+                if rows_count <= cfg.log_first_n_events:
+                    _log(
+                        cfg,
+                        (
+                            "queued event "
+                            f"topic={topic} "
+                            f"commit_scn={row.get('commit_scn')} "
+                            f"schema={row.get('seg_owner')} table={row.get('table_name')} "
+                            f"operation={row.get('operation')}"
+                        ),
+                    )
+
+        timings["fetch_rows_sec"] = t_fetch_total
+        timings["publish_rows_sec"] = t_publish_total
+        _log(cfg, f"rows fetched from v$logmnr_contents: {rows_count}")
 
         # 7) Flush и проверка ошибок delivery.
+        # После flush считаем батч успешным только если failed == 0.
+        # Это важно для one-shot режима: иначе cron увидит ложный успех.
         t_flush = time.monotonic()
         producer.flush(cfg.kafka_flush_timeout_sec)
         timings["flush_sec"] = time.monotonic() - t_flush
@@ -705,18 +809,21 @@ def run_once(cfg: Config) -> Dict[str, Any]:
             cfg,
             (
                 "kafka flush done "
-                f"(delivered={delivered}, failed={failed}, queued={len(rows)}, "
+                f"(delivered={delivered}, failed={failed}, queued={rows_count}, "
                 f"queue_full_retries={queue_full_retries}, "
                 f"queue_full_wait_sec={queue_full_wait_sec:.3f})"
             ),
         )
         if failed > 0:
-            raise RuntimeError(f"Kafka delivery failures: {failed} of {len(rows)}")
+            raise RuntimeError(f"Kafka delivery failures: {failed} of {rows_count}")
 
         # 8) Обновляем state watermark.
-        if rows:
-            # commit_scn гарантированно NOT NULL по условию выборки в _fetch_rows.
-            new_commit_scn = max(int(r["commit_scn"]) for r in rows)
+        # State пишем только после успешного flush и нулевого failed.
+        # Это защищает от "подтверждения прогресса" при частично доставленных сообщениях.
+        if rows_count > 0:
+            # commit_scn гарантированно NOT NULL по условию выборки в _build_fetch_rows_query.
+            # Данные отсортированы по commit_scn ASC, поэтому last_batch_commit_scn — максимум.
+            new_commit_scn = int(last_batch_commit_scn)
             last_commit_scn = max(last_commit_scn, new_commit_scn)
             _save_state(cfg, last_commit_scn)
             _log(cfg, f"state updated: last_commit_scn={last_commit_scn}")
@@ -740,10 +847,8 @@ def run_once(cfg: Config) -> Dict[str, Any]:
         # lag_to_logs_tail_scn:
         #   Приблизительное отставание от хвоста выбранного окна:
         #   logs_max_next_change - to_commit_scn (если next_change доступен).
-        row_commit_scns = [int(r["commit_scn"]) for r in rows]
         # Фактические границы commit_scn в самом батче (по реальным строкам).
-        first_batch_commit_scn = min(row_commit_scns) if row_commit_scns else None
-        last_batch_commit_scn = max(row_commit_scns) if row_commit_scns else None
+        # Значения уже рассчитаны в потоковой обработке выше.
 
         # Границы SCN по выбранным archived logs.
         log_first_changes = [int(item["first_change"]) for item in archived_logs if item.get("first_change") is not None]
@@ -773,6 +878,7 @@ def run_once(cfg: Config) -> Dict[str, Any]:
             "state_advanced": state_advanced,
         }
         # Короткая строка для оперативного просмотра в cron/docker логах.
+        # Она специально компактная, чтобы легко читать глазами и парсить grep'ом.
         _log(
             cfg,
             (
@@ -785,9 +891,10 @@ def run_once(cfg: Config) -> Dict[str, Any]:
             ),
         )
 
+        # 10) Формируем итоговый result для логов/интеграций.
         timings["total_sec"] = time.monotonic() - t0
         result = {
-            "rows": len(rows),
+            "rows": rows_count,
             "delivered": delivered,
             "failed": failed,
             "queue_full_retries": queue_full_retries,
@@ -801,7 +908,8 @@ def run_once(cfg: Config) -> Dict[str, Any]:
         _log(cfg, f"batch finished: {result}")
         return result
     finally:
-        # 9) Гарантированный cleanup.
+        # 11) Гарантированный cleanup.
+        # Выполняем даже при исключениях, чтобы не оставлять висящие ресурсы.
         try:
             if cur is not None:
                 try:

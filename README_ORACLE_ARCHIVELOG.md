@@ -50,6 +50,8 @@ docker compose run --rm oracle-producer-archivelog
   - `START_FROM_SCN`
 - Batch/control:
   - `MAX_ROWS_PER_BATCH` (по умолчанию `5000`, `0` = без лимита)
+  - `USE_FETCHMANY` (`true|false`, по умолчанию `true`)
+  - `FETCHMANY_SIZE` (по умолчанию `1000`, размер чанка Oracle fetchmany)
   - `PRODUCE_RETRY_TIMEOUT_SEC` (по умолчанию `60`)
   - `PRODUCE_RETRY_POLL_SEC` (по умолчанию `0.2`)
   - `LOG_FIRST_N_EVENTS` (по умолчанию `3`)
@@ -109,6 +111,7 @@ print(stats)
 
 - `run_once(...)` берет ориентир `max_rows_per_batch`, но не режет один commit пополам:
   если на границе лимита идет тот же `commit_scn`, скрипт добирает commit целиком.
+- По умолчанию чтение Oracle-курсора идет потоково через `fetchmany` (меньше потребление памяти).
 - Остальные изменения будут обработаны на следующем запуске.
 - При переполнении локальной очереди producer используется retry с таймаутом (без бесконечного цикла).
 - Скрипт обрабатывает только записи с непустым `commit_scn` (`commit_scn IS NOT NULL`).
