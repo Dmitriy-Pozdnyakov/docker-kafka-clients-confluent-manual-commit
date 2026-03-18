@@ -25,6 +25,12 @@ cp env/oracle-producer-archivelog.env.example env/oracle-producer-archivelog.env
 docker compose run --rm oracle-producer-archivelog
 ```
 
+Сейчас контейнерный скрипт работает в one-shot режиме:
+
+- один запуск = один батч;
+- код завершения `0` при успехе, `!=0` при ошибке;
+- для периодики используется cron на VM.
+
 ## 3) Основные env-параметры (контейнерный вариант)
 
 - Oracle:
@@ -39,10 +45,9 @@ docker compose run --rm oracle-producer-archivelog
   - `KAFKA_SECURITY_PROTOCOL` (`PLAINTEXT|SSL|SASL_SSL|SASL_PLAINTEXT`)
   - `SSL_CAFILE`, `SSL_CHECK_HOSTNAME`
   - `KAFKA_SASL_MECHANISM`, `KAFKA_SASL_USERNAME`, `KAFKA_SASL_PASSWORD`
-- State/loop:
+- State:
   - `STATE_FILE`
   - `START_FROM_SCN`
-  - `POLL_SECONDS`
 - Batch/control:
   - `MAX_ROWS_PER_BATCH` (по умолчанию `5000`, `0` = без лимита)
   - `PRODUCE_RETRY_TIMEOUT_SEC` (по умолчанию `60`)
@@ -105,6 +110,14 @@ print(stats)
 - `run_once(...)` обрабатывает до `max_rows_per_batch`.
 - Остальные изменения будут обработаны на следующем запуске.
 - При переполнении локальной очереди producer используется retry с таймаутом (без бесконечного цикла).
+
+## 8) Пример cron на VM (рекомендуется)
+
+```bash
+* * * * * cd /opt/cdc && /usr/bin/flock -n /opt/cdc/state/oracle-archivelog.lock docker compose run --rm oracle-producer-archivelog >> /var/log/oracle-archivelog-producer.log 2>&1
+```
+
+Это защищает от параллельных запусков и сохраняет логи между джобами.
 
 ## 7) Topic Per Table
 

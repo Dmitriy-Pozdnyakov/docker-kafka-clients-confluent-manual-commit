@@ -5,14 +5,12 @@ Oracle LogMiner (archived logs) -> Kafka, Docker/env-friendly entrypoint.
 Структура намеренно синхронизирована с jupyter-вариантом:
 - конфиг через dataclass `Config`;
 - один батч через `run_once(config)`;
-- цикл через `run_loop(config)`;
+- entrypoint `main()` работает в one-shot режиме (для cron/docker compose run);
 - подробные комментарии по шагам.
 """
 
 import json
 import os
-import signal
-import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -63,7 +61,7 @@ class Config:
     # =========================
     # Loop mode
     # =========================
-    poll_seconds: int = 60  # пауза между батчами в run_loop()
+    poll_seconds: int = 60  # legacy параметр: в one-shot режиме контейнера не используется
 
     # =========================
     # Data filters
@@ -79,10 +77,6 @@ class Config:
     # =========================
     verbose: bool = True  # включить подробные логи
     log_first_n_events: int = 3  # сколько первых событий батча логировать детально
-
-
-RUNNING = True
-
 
 def _log(cfg: Config, message: str) -> None:
     # Единый формат логов: печатаем только при verbose.
@@ -602,42 +596,25 @@ def run_once(cfg: Config) -> Dict[str, Any]:
             producer.flush(cfg.kafka_flush_timeout_sec)
 
 
-def run_loop(cfg: Config) -> None:
-    # Бесконечный цикл батчей до сигнала остановки.
-    while RUNNING:
-        try:
-            stats = run_once(cfg)
-            _log(cfg, f"batch stats: {stats}")
-        except Exception as exc:
-            print(f"[oracle->kafka:archivelog] ERROR: {exc}", file=sys.stderr)
-        if RUNNING:
-            time.sleep(cfg.poll_seconds)
-
-
-def _handle_shutdown(signum, _frame) -> None:
-    # Graceful shutdown: просим цикл завершиться после текущей итерации.
-    global RUNNING
-    RUNNING = False
-    print(f"[oracle->kafka:archivelog] received signal={signum}, shutting down...")
-
-
 def main() -> int:
     cfg = load_config_from_env()
     validate_config(cfg)
 
-    signal.signal(signal.SIGINT, _handle_shutdown)
-    signal.signal(signal.SIGTERM, _handle_shutdown)
-
     _log(
         cfg,
         (
-            "start "
-            f"(dsn={cfg.oracle_dsn}, topic={cfg.kafka_topic}, poll={cfg.poll_seconds}s, "
+            "start one-shot batch "
+            f"(dsn={cfg.oracle_dsn}, topic={cfg.kafka_topic}, "
             f"archive_log_limit={cfg.archive_log_limit}, state_file={cfg.state_file})"
         ),
     )
-    run_loop(cfg)
-    return 0
+    try:
+        stats = run_once(cfg)
+        _log(cfg, f"one-shot finished: {stats}")
+        return 0
+    except Exception as exc:
+        print(f"[oracle->kafka:archivelog] ERROR: {exc}")
+        return 1
 
 
 if __name__ == "__main__":
