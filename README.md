@@ -75,7 +75,7 @@ docker compose run --rm oracle-producer-archivelog
 
 - читает Oracle LogMiner (`V$LOGMNR_CONTENTS`)
 - пишет события в `KAFKA_TOPIC` (по умолчанию `oracle.logminer.raw`)
-- хранит watermark в `./state/oracle_kafka_state.json`
+- хранит watermark в `./state/oracle_kafka_state_archivelog.json`
 
 ## TLS сертификат
 

@@ -239,22 +239,118 @@ def _end_logminer(cur: oracledb.Cursor) -> None:
     )
 
 
-def _get_archived_logs(cur: oracledb.Cursor, limit_rows: int) -> List[str]:
-    # Берем N последних archived log файлов и разворачиваем в хронологический порядок.
+def _get_archived_logs(
+    cur: oracledb.Cursor,
+    from_commit_scn: int,
+    limit_rows: int,
+) -> List[Dict[str, Any]]:
+    def to_int_or_none(value: Any) -> Optional[int]:
+        # Безопасно приводим Oracle-значение к int:
+        # - NULL в БД остается None;
+        # - непустое значение приводим к int.
+        return None if value is None else int(value)
+
+    def fetch_dict_rows(sql_text: str, binds: Dict[str, Any]) -> List[Dict[str, Any]]:
+        # Используем rowfactory, чтобы получать строки сразу как dict по именам колонок.
+        # Это делает код заметно читаемее и убирает зависимость от row[0], row[1], ...
+        previous_rowfactory = cur.rowfactory
+        try:
+            cur.execute(sql_text, binds)
+            columns = [col[0].lower() for col in cur.description]
+            cur.rowfactory = lambda *args: dict(zip(columns, args))
+            rows = cur.fetchall()
+            normalized: List[Dict[str, Any]] = []
+            for row in rows:
+                normalized.append(
+                    {
+                        "thread": to_int_or_none(row.get("thread#")),
+                        "sequence": to_int_or_none(row.get("sequence#")),
+                        "first_change": to_int_or_none(row.get("first_change#")),
+                        "next_change": to_int_or_none(row.get("next_change#")),
+                        "name": row.get("name"),
+                    }
+                )
+            return normalized
+        finally:
+            cur.rowfactory = previous_rowfactory
+
+    # Выбираем archived logs "от watermark", а не просто "последние N":
+    # 1) anchor: лог, который покрывает from_commit_scn;
+    # 2) tail: последовательный хвост логов после anchor по sequence#.
+    #
+    # Почему это важно:
+    # - если брать только "последние N", можно пропустить нужный диапазон SCN;
+    # - anchor+tail дает непрерывную цепочку от текущей точки state.
     sql = """
-    SELECT name
+    WITH anchor AS (
+      SELECT thread#, sequence#, first_change#, next_change#, name
+      FROM (
+        SELECT thread#, sequence#, first_change#, next_change#, name
+        FROM v$archived_log
+        WHERE name IS NOT NULL
+          AND first_change# <= :from_scn
+          AND (next_change# > :from_scn OR next_change# IS NULL)
+        ORDER BY sequence# DESC
+      )
+      WHERE ROWNUM = 1
+    ),
+    tail AS (
+      SELECT
+        l.thread#,
+        l.sequence#,
+        l.first_change#,
+        l.next_change#,
+        l.name
+      FROM v$archived_log l
+      JOIN anchor a
+        ON l.thread# = a.thread#
+       AND l.sequence# >= a.sequence#
+      WHERE l.name IS NOT NULL
+      ORDER BY l.sequence# ASC
+    )
+    SELECT thread#, sequence#, first_change#, next_change#, name
     FROM (
-      SELECT name
-      FROM v$archived_log
-      WHERE name IS NOT NULL
-      ORDER BY sequence# DESC
+      SELECT thread#, sequence#, first_change#, next_change#, name
+      FROM tail
     )
     WHERE ROWNUM <= :limit_rows
     """
-    cur.execute(sql, {"limit_rows": limit_rows})
-    files = [r[0] for r in cur.fetchall() if r and r[0]]
-    files.reverse()
-    return files
+
+    rows = fetch_dict_rows(
+        sql,
+        {
+            "from_scn": int(from_commit_scn),
+            "limit_rows": int(limit_rows),
+        },
+    )
+    if rows:
+        return rows
+
+    # Отдельный fallback только для самого первого запуска:
+    # если from_commit_scn <= 0, нет "якоря" и можно взять последние N как bootstrap.
+    # Для нормального прод-режима from_commit_scn должен быть валидным и попадать в archived logs.
+    if int(from_commit_scn) <= 0:
+        bootstrap_sql = """
+        SELECT thread#, sequence#, first_change#, next_change#, name
+        FROM (
+          SELECT thread#, sequence#, first_change#, next_change#, name
+          FROM v$archived_log
+          WHERE name IS NOT NULL
+          ORDER BY sequence# DESC
+        )
+        WHERE ROWNUM <= :limit_rows
+        """
+        bootstrap_rows = fetch_dict_rows(bootstrap_sql, {"limit_rows": int(limit_rows)})
+        # Приводим к хронологическому порядку.
+        return list(reversed(bootstrap_rows))
+
+    # Если anchor не найден при from_commit_scn > 0:
+    # это значит, что нужный SCN диапазон уже отсутствует в archived logs
+    # (например, логи удалены из-за retention), и продолжать небезопасно.
+    raise RuntimeError(
+        "Cannot locate archived logs for state SCN "
+        f"{from_commit_scn}. Required SCN range is not available in v$archived_log."
+    )
 
 
 def _add_logfile(cur: oracledb.Cursor, logfile: str, first: bool) -> None:
@@ -306,7 +402,7 @@ def _fetch_rows(
     max_rows_per_batch: int,
 ) -> List[Dict[str, Any]]:
     # Базовый SQL: только DML после watermark commit_scn.
-    sql = """
+    base_sql = """
     SELECT
       commit_scn,
       scn,
@@ -322,6 +418,7 @@ def _fetch_rows(
       sql_undo
     FROM v$logmnr_contents
     WHERE operation_code IN (1, 2, 3)
+      AND commit_scn IS NOT NULL
       AND commit_scn > :from_commit_scn
     """
     binds: Dict[str, Any] = {"from_commit_scn": from_commit_scn}
@@ -332,7 +429,7 @@ def _fetch_rows(
             bind_name = f"filter_schema_{idx}"
             schema_placeholders.append(f":{bind_name}")
             binds[bind_name] = schema_name
-        sql += f" AND seg_owner IN ({', '.join(schema_placeholders)})"
+        base_sql += f" AND seg_owner IN ({', '.join(schema_placeholders)})"
 
     if filter_tables:
         table_placeholders = []
@@ -340,13 +437,57 @@ def _fetch_rows(
             bind_name = f"filter_table_{idx}"
             table_placeholders.append(f":{bind_name}")
             binds[bind_name] = table_name
-        sql += f" AND table_name IN ({', '.join(table_placeholders)})"
+        base_sql += f" AND table_name IN ({', '.join(table_placeholders)})"
 
-    sql += " ORDER BY commit_scn, sequence#, rs_id, ssn"
+    order_by = " ORDER BY commit_scn, sequence#, rs_id, ssn"
 
     if max_rows_per_batch > 0:
-        sql = f"SELECT * FROM ({sql}) WHERE ROWNUM <= :max_rows_per_batch"
+        # Важный момент для надежности:
+        # MAX_ROWS_PER_BATCH не должен "резать" один commit на две итерации.
+        #
+        # Логика:
+        # 1) нумеруем строки в стабильном порядке;
+        # 2) находим commit_scn строки на позиции max_rows_per_batch (через MAX(commit_scn) по rn<=N);
+        # 3) возвращаем все строки с commit_scn <= cutoff_commit_scn.
+        #
+        # Итог: размер батча может быть чуть больше N, но commit всегда полный.
+        sql = f"""
+        WITH base_rows AS (
+          {base_sql}
+        ),
+        ranked_rows AS (
+          SELECT
+            b.*,
+            ROW_NUMBER() OVER (ORDER BY commit_scn, redo_sequence, rs_id, ssn) AS rn
+          FROM base_rows b
+        ),
+        cutoff AS (
+          SELECT MAX(commit_scn) AS cutoff_commit_scn
+          FROM ranked_rows
+          WHERE rn <= :max_rows_per_batch
+        )
+        SELECT
+          r.commit_scn,
+          r.scn,
+          r.timestamp,
+          r.seg_owner,
+          r.table_name,
+          r.operation,
+          r.operation_code,
+          r.redo_sequence,
+          r.rs_id,
+          r.ssn,
+          r.sql_redo,
+          r.sql_undo
+        FROM ranked_rows r
+        CROSS JOIN cutoff c
+        WHERE c.cutoff_commit_scn IS NOT NULL
+          AND r.commit_scn <= c.cutoff_commit_scn
+        {order_by}
+        """
         binds["max_rows_per_batch"] = int(max_rows_per_batch)
+    else:
+        sql = f"{base_sql}{order_by}"
 
     cur.execute(sql, binds)
     columns = [c[0].lower() for c in cur.description]
@@ -484,13 +625,28 @@ def run_once(cfg: Config) -> Dict[str, Any]:
         _ = cur.fetchone()
         _log(cfg, "access check to v$logmnr_contents passed")
 
-        # 4) Выбираем archived logs и стартуем LogMiner.
+        # 4) Выбираем archived logs от state SCN и стартуем LogMiner.
         t_logs = time.monotonic()
-        logs = _get_archived_logs(cur, cfg.archive_log_limit)
+        archived_logs = _get_archived_logs(
+            cur=cur,
+            from_commit_scn=last_commit_scn,
+            limit_rows=cfg.archive_log_limit,
+        )
+        logs = [str(item["name"]) for item in archived_logs if item.get("name")]
         timings["select_archived_logs_sec"] = time.monotonic() - t_logs
         _log(cfg, f"archived logs selected: {len(logs)}")
-        for lf in logs:
-            _log(cfg, f"  logfile: {lf}")
+        for item in archived_logs:
+            _log(
+                cfg,
+                (
+                    "  logfile: "
+                    f"name={item.get('name')} "
+                    f"thread={item.get('thread')} "
+                    f"sequence={item.get('sequence')} "
+                    f"first_change={item.get('first_change')} "
+                    f"next_change={item.get('next_change')}"
+                ),
+            )
 
         t_logminer = time.monotonic()
         _start_logminer(cur, cfg, logs)
@@ -558,7 +714,8 @@ def run_once(cfg: Config) -> Dict[str, Any]:
 
         # 8) Обновляем state watermark.
         if rows:
-            new_commit_scn = max(int(r["commit_scn"]) for r in rows if r.get("commit_scn") is not None)
+            # commit_scn гарантированно NOT NULL по условию выборки в _fetch_rows.
+            new_commit_scn = max(int(r["commit_scn"]) for r in rows)
             last_commit_scn = max(last_commit_scn, new_commit_scn)
             _save_state(cfg, last_commit_scn)
             _log(cfg, f"state updated: last_commit_scn={last_commit_scn}")

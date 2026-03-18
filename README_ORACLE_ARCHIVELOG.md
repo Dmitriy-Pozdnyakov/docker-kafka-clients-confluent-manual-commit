@@ -7,7 +7,7 @@
 
 ## 1) Что делает скрипт
 
-1. Читает `v$archived_log`, выбирает последние archived logs.
+1. Читает `v$archived_log`, выбирает archived logs от текущего `state` (`last_commit_scn`) и добирает последовательный хвост.
 2. Запускает `DBMS_LOGMNR.START_LOGMNR`.
 3. Читает изменения из `v$logmnr_contents` (DML: insert/update/delete).
 4. Пишет события в Kafka topic.
@@ -107,17 +107,11 @@ print(stats)
 
 ## 6) Поведение батча
 
-- `run_once(...)` обрабатывает до `max_rows_per_batch`.
+- `run_once(...)` берет ориентир `max_rows_per_batch`, но не режет один commit пополам:
+  если на границе лимита идет тот же `commit_scn`, скрипт добирает commit целиком.
 - Остальные изменения будут обработаны на следующем запуске.
 - При переполнении локальной очереди producer используется retry с таймаутом (без бесконечного цикла).
-
-## 8) Пример cron на VM (рекомендуется)
-
-```bash
-* * * * * cd /opt/cdc && /usr/bin/flock -n /opt/cdc/state/oracle-archivelog.lock docker compose run --rm oracle-producer-archivelog >> /var/log/oracle-archivelog-producer.log 2>&1
-```
-
-Это защищает от параллельных запусков и сохраняет логи между джобами.
+- Скрипт обрабатывает только записи с непустым `commit_scn` (`commit_scn IS NOT NULL`).
 
 ## 7) Topic Per Table
 
@@ -134,3 +128,11 @@ docker compose run --rm \
 Формат topic:
 
 - `oracle.cdc.<schema>.<table>` (с нормализацией в lower-case)
+
+## 8) Пример cron на VM (рекомендуется)
+
+```bash
+* * * * * cd /opt/cdc && /usr/bin/flock -n /opt/cdc/state/oracle-archivelog.lock docker compose run --rm oracle-producer-archivelog >> /var/log/oracle-archivelog-producer.log 2>&1
+```
+
+Это защищает от параллельных запусков и сохраняет логи между джобами.
