@@ -70,6 +70,14 @@ docker compose run --rm oracle-producer-archivelog
 Подробная инструкция по archived-log версии:
 
 - `README_ORACLE_ARCHIVELOG.md`
+- `app/oracle_logminer_cdc/README.md` (вариант с Schema Registry + CDC envelope)
+
+Быстрый запуск SR-прототипа:
+
+```bash
+docker compose run --rm oracle-producer-archivelog \
+  python app/oracle_logminer_cdc/producer_archivelog_sr.py
+```
 
 Логика:
 

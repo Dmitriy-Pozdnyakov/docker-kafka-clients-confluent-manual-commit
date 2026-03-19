@@ -11,6 +11,46 @@ services:
       - ./state:/state
     restart: "no"
 
+  oracle-producer-archivelog-sr:
+    build: .
+    mem_limit: ${ORACLE_PRODUCER_SR_MEM_LIMIT:-512m}
+    cpus: ${ORACLE_PRODUCER_SR_CPUS:-0.50}
+    env_file:
+      - ./app/oracle_logminer_cdc/oracle-producer-archivelog-sr.env
+    command: ["python", "app/oracle_logminer_cdc/producer_archivelog_sr.py"]
+    volumes:
+      - ./certs/ca.crt:/certs/ca.crt:ro
+      - ./state:/state
+    restart: "no"
+
+  oracle-schema-build:
+    build: .
+    mem_limit: ${ORACLE_SCHEMA_BUILD_MEM_LIMIT:-512m}
+    cpus: ${ORACLE_SCHEMA_BUILD_CPUS:-0.50}
+    env_file:
+      - ./app/oracle_logminer_cdc/oracle-schema-build.env
+    command:
+      - "sh"
+      - "-c"
+      - >
+        python app/oracle_logminer_cdc/build_schemas_from_oracle.py
+        --oracle-user "$$ORACLE_USER"
+        --oracle-password "$$ORACLE_PASSWORD"
+        --oracle-dsn "$$ORACLE_DSN"
+        --topic-prefix "$${TOPIC_PREFIX:-oracle.cdc}"
+        --topic-separator "$${TOPIC_SEPARATOR:-.}"
+        --schema-dir "$${SCHEMA_DIR:-app/oracle_logminer_cdc/schemas}"
+        --key-mode "$${KEY_MODE:-technical}"
+        --tables "$${TABLES:-}"
+        $${TABLES_FILE:+--tables-file "$$TABLES_FILE"}
+        $${OVERWRITE:+--overwrite}
+        $${REGISTER_SR:+--register-sr}
+        $${SCHEMA_REGISTRY_URL:+--sr-url "$$SCHEMA_REGISTRY_URL"}
+        $${SCHEMA_REGISTRY_BASIC_AUTH_USER_INFO:+--sr-auth "$$SCHEMA_REGISTRY_BASIC_AUTH_USER_INFO"}
+    volumes:
+      - ./app/oracle_logminer_cdc/schemas:/app/oracle_logminer_cdc/schemas
+    restart: "no"
+
   producer:
     build: .
     mem_limit: ${PRODUCER_MEM_LIMIT:-256m}
