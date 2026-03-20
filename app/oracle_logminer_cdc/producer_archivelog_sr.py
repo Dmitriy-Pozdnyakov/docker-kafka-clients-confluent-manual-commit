@@ -252,7 +252,7 @@ def _build_fetch_rows_query(
             binds[key] = value
         base_sql += f" AND table_name IN ({', '.join(ph)})"
 
-    order_by = " ORDER BY commit_scn, sequence#, rs_id, ssn"
+    order_by = " ORDER BY commit_scn, redo_sequence, rs_id, ssn"
     if max_rows_per_batch > 0:
         sql = f"""
         WITH base_rows AS ({base_sql}),
@@ -547,20 +547,27 @@ def run_once(cfg: Config) -> Dict[str, Any]:
 
         _log(cfg, f"rows fetched from v$logmnr_contents: {rows_count}")
 
-        # ВАЖНО: flush дожидается отправки сообщений из локальной очереди producer.
-        # После flush мы уже можем корректно оценить delivered/failed.
-        producer.flush(cfg.kafka_flush_timeout_sec)
+        # ВАЖНО: flush возвращает количество сообщений, оставшихся в локальной очереди.
+        # Для one-shot сценария это критичный сигнал: если > 0, подтверждать SCN нельзя.
+        remaining_after_flush = producer.flush(cfg.kafka_flush_timeout_sec)
         _log(
             cfg,
             (
                 "kafka flush done "
                 f"(delivered={delivered}, failed={failed}, queued={rows_count}, "
+                f"remaining_after_flush={remaining_after_flush}, "
                 f"queue_full_retries={queue_full_retries}, "
                 f"queue_full_wait_sec={queue_full_wait_sec:.3f})"
             ),
         )
         if failed > 0:
             raise RuntimeError(f"Kafka delivery failures: {failed} of {rows_count}")
+        if remaining_after_flush > 0:
+            raise RuntimeError(
+                "Kafka flush timeout: "
+                f"{remaining_after_flush} messages left in producer queue "
+                f"after {cfg.kafka_flush_timeout_sec}s"
+            )
 
         # Обновляем state только после успешного flush и при отсутствии failed.
         # Это защищает от потери данных при перезапуске one-shot джобы.
@@ -575,6 +582,7 @@ def run_once(cfg: Config) -> Dict[str, Any]:
             "rows": rows_count,
             "delivered": delivered,
             "failed": failed,
+            "remaining_after_flush": remaining_after_flush,
             "queue_full_retries": queue_full_retries,
             "queue_full_wait_sec": round(queue_full_wait_sec, 3),
             "last_commit_scn": last_commit_scn,

@@ -2,3 +2,4 @@
 state/*.json
 .pycache_local/
 app/oracle_logminer_cdc/schemas/
+certs/
