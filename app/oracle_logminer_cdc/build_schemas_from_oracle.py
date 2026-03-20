@@ -115,10 +115,10 @@ def _load_table_metadata(conn: oracledb.Connection, owner: str, table: str) -> D
             """
             SELECT column_name, data_type, nullable, column_id
             FROM all_tab_columns
-            WHERE owner = :owner AND table_name = :table
+            WHERE owner = :owner AND table_name = :table_name
             ORDER BY column_id
             """,
-            {"owner": owner.upper(), "table": table.upper()},
+            {"owner": owner.upper(), "table_name": table.upper()},
         )
         columns = [
             {
@@ -139,11 +139,11 @@ def _load_table_metadata(conn: oracledb.Connection, owner: str, table: str) -> D
              AND a.constraint_name = c.constraint_name
              AND a.table_name = c.table_name
             WHERE a.owner = :owner
-              AND a.table_name = :table
+              AND a.table_name = :table_name
               AND a.constraint_type = 'P'
             ORDER BY c.position
             """,
-            {"owner": owner.upper(), "table": table.upper()},
+            {"owner": owner.upper(), "table_name": table.upper()},
         )
         pk_columns = [str(column_name).upper() for column_name, _position in cur.fetchall()]
 
