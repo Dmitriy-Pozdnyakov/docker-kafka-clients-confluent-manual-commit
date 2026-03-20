@@ -207,9 +207,11 @@ def load_table_metadata(conn: oracledb.Connection, owner: str, table: str) -> Ta
 # insert into HR.EMP (ID, NAME) values (1, 'Ann')
 # groups:
 # - columns -> "ID, NAME"
-# - values  -> "1, 'Ann'"
-_INSERT_VALUES_RE = re.compile(
-    r"insert\s+into\s+.+?\((?P<columns>.+?)\)\s+values\s*\((?P<values>.+?)\)",
+#
+# values-часть дальше разбираем отдельным балансировщиком скобок,
+# чтобы корректно обрабатывать вложенные вызовы TO_DATE(...), TO_TIMESTAMP(...).
+_INSERT_HEAD_RE = re.compile(
+    r"insert\s+into\s+.+?\((?P<columns>.+?)\)\s+values\s*",
     flags=re.IGNORECASE | re.DOTALL,
 )
 
@@ -234,6 +236,7 @@ def _split_csv_sql(text: str) -> List[str]:
     items: List[str] = []
     buf: List[str] = []
     in_string = False
+    paren_depth = 0
     i = 0
     while i < len(text):
         ch = text[i]
@@ -244,7 +247,14 @@ def _split_csv_sql(text: str) -> List[str]:
                 i += 2
                 continue
             in_string = not in_string
-        elif ch == "," and not in_string:
+        elif not in_string and ch == "(":
+            paren_depth += 1
+            buf.append(ch)
+        elif not in_string and ch == ")":
+            if paren_depth > 0:
+                paren_depth -= 1
+            buf.append(ch)
+        elif ch == "," and not in_string and paren_depth == 0:
             items.append("".join(buf).strip())
             buf = []
             i += 1
@@ -269,7 +279,20 @@ def _sql_literal_to_python(token: str) -> Any:
     if upper.startswith("TO_DATE(") or upper.startswith("TO_TIMESTAMP("):
         return token
     if token.startswith("'") and token.endswith("'"):
-        return token[1:-1].replace("''", "'")
+        inner = token[1:-1].replace("''", "'")
+        # В SQL_REDO/SQL_UNDO Oracle часто сериализует NUMBER как строку: '21', '4200'.
+        # Для CDC-схем это должно быть number, поэтому конвертируем numeric-like строковые литералы.
+        if re.fullmatch(r"[-+]?\d+", inner):
+            try:
+                return int(inner)
+            except Exception:
+                return inner
+        if re.fullmatch(r"[-+]?\d+\.\d+", inner):
+            try:
+                return float(inner)
+            except Exception:
+                return inner
+        return inner
     if re.fullmatch(r"[-+]?\d+", token):
         try:
             return int(token)
@@ -285,8 +308,67 @@ def _sql_literal_to_python(token: str) -> Any:
 
 def _parse_assignment_map(clause: str) -> RowDict:
     """Парсит выражения вида `COL=VALUE, ...` в dict."""
+    def split_assignments(text: str) -> List[str]:
+        """Делит выражение по top-level разделителям: `,` и `AND`."""
+        parts: List[str] = []
+        buf: List[str] = []
+        in_string = False
+        paren_depth = 0
+        i = 0
+        n = len(text)
+        while i < n:
+            ch = text[i]
+            if ch == "'":
+                buf.append(ch)
+                if in_string and i + 1 < n and text[i + 1] == "'":
+                    buf.append(text[i + 1])
+                    i += 2
+                    continue
+                in_string = not in_string
+                i += 1
+                continue
+
+            if not in_string:
+                if ch == "(":
+                    paren_depth += 1
+                    buf.append(ch)
+                    i += 1
+                    continue
+                if ch == ")":
+                    if paren_depth > 0:
+                        paren_depth -= 1
+                    buf.append(ch)
+                    i += 1
+                    continue
+                if paren_depth == 0:
+                    if ch == ",":
+                        part = "".join(buf).strip()
+                        if part:
+                            parts.append(part)
+                        buf = []
+                        i += 1
+                        continue
+                    if text[i : i + 3].upper() == "AND":
+                        prev_ok = i == 0 or text[i - 1].isspace()
+                        next_ok = i + 3 >= n or text[i + 3].isspace()
+                        if prev_ok and next_ok:
+                            part = "".join(buf).strip()
+                            if part:
+                                parts.append(part)
+                            buf = []
+                            i += 3
+                            continue
+
+            buf.append(ch)
+            i += 1
+
+        tail = "".join(buf).strip()
+        if tail:
+            parts.append(tail)
+        return parts
+
     result: RowDict = {}
-    for item in _split_csv_sql(clause):
+    for item in split_assignments(clause):
         match = _ASSIGNMENT_RE.match(item.strip())
         if not match:
             continue
@@ -295,13 +377,67 @@ def _parse_assignment_map(clause: str) -> RowDict:
     return result
 
 
+def _extract_parenthesized_content(text: str, open_paren_idx: int) -> str:
+    """Возвращает содержимое круглых скобок с учетом вложенности и строк."""
+    if open_paren_idx < 0 or open_paren_idx >= len(text) or text[open_paren_idx] != "(":
+        raise RuntimeError("Parenthesized SQL parser: expected '(' at open_paren_idx")
+
+    in_string = False
+    depth = 0
+    buf: List[str] = []
+    i = open_paren_idx
+    while i < len(text):
+        ch = text[i]
+        if ch == "'":
+            if in_string and i + 1 < len(text) and text[i + 1] == "'":
+                if depth > 0:
+                    buf.append(ch)
+                    buf.append(text[i + 1])
+                i += 2
+                continue
+            in_string = not in_string
+            if depth > 0:
+                buf.append(ch)
+            i += 1
+            continue
+
+        if not in_string and ch == "(":
+            depth += 1
+            if depth > 1:
+                buf.append(ch)
+            i += 1
+            continue
+
+        if not in_string and ch == ")":
+            depth -= 1
+            if depth == 0:
+                return "".join(buf).strip()
+            if depth < 0:
+                break
+            buf.append(ch)
+            i += 1
+            continue
+
+        if depth > 0:
+            buf.append(ch)
+        i += 1
+
+    raise RuntimeError("Parenthesized SQL parser: unmatched parentheses")
+
+
 def _parse_insert_sql(sql_redo: str) -> RowDict:
     """Прототипный parser INSERT ... VALUES (...)."""
-    match = _INSERT_VALUES_RE.search(sql_redo.strip())
+    sql_text = sql_redo.strip()
+    match = _INSERT_HEAD_RE.search(sql_text)
     if not match:
         raise RuntimeError("Unsupported INSERT SQL_REDO pattern for prototype parser")
+
     columns = [part.strip().strip('"').upper() for part in _split_csv_sql(match.group("columns"))]
-    values = [_sql_literal_to_python(part) for part in _split_csv_sql(match.group("values"))]
+    values_part = sql_text[match.end() :].lstrip()
+    if not values_part.startswith("("):
+        raise RuntimeError("INSERT parser mismatch: VALUES clause is not parenthesized")
+    values_raw = _extract_parenthesized_content(values_part, 0)
+    values = [_sql_literal_to_python(part) for part in _split_csv_sql(values_raw)]
     if len(columns) != len(values):
         raise RuntimeError("INSERT parser mismatch: columns/value counts differ")
     return dict(zip(columns, values))
@@ -380,6 +516,67 @@ def _build_technical_key_object(row: RowDict) -> RowDict:
     }
 
 
+def _coerce_value_by_oracle_type(value: Any, oracle_type: str) -> Any:
+    """Приводит parsed literal к ожидаемому python-типу по Oracle data type.
+
+    Нужен в первую очередь для NUMBER-колонок:
+    LogMiner SQL parser может отдать '21' (str), а схема ожидает number.
+    """
+    if value is None:
+        return None
+
+    t = str(oracle_type or "").upper()
+    if not t:
+        return value
+
+    is_numeric = (
+        t.startswith("NUMBER")
+        or t.startswith("FLOAT")
+        or t.startswith("BINARY_FLOAT")
+        or t.startswith("BINARY_DOUBLE")
+        or t.startswith("DECIMAL")
+        or t.startswith("INTEGER")
+        or t.startswith("INT")
+        or t.startswith("SMALLINT")
+    )
+    if not is_numeric:
+        return value
+
+    if isinstance(value, (int, float)):
+        return value
+
+    if not isinstance(value, str):
+        return value
+
+    token = value.strip()
+    if re.fullmatch(r"[-+]?\d+", token):
+        try:
+            return int(token)
+        except Exception:
+            return value
+    if re.fullmatch(r"[-+]?\d+\.\d+", token):
+        try:
+            return float(token)
+        except Exception:
+            return value
+    return value
+
+
+def _coerce_row_image_types(row_image: Optional[RowDict], table_meta: TableMeta) -> Optional[RowDict]:
+    """Приводит типы значений parsed row-image на основе metadata таблицы."""
+    if row_image is None:
+        return None
+
+    type_by_col = {
+        str(col.get("name", "")).upper(): str(col.get("oracle_type", "")).upper()
+        for col in table_meta.get("columns", [])
+    }
+    out: RowDict = {}
+    for col_name, col_value in row_image.items():
+        out[col_name] = _coerce_value_by_oracle_type(col_value, type_by_col.get(str(col_name).upper(), ""))
+    return out
+
+
 def build_cdc_event(row: RowDict, table_meta: TableMeta, cfg: Any) -> Tuple[RowDict, RowDict]:
     """Строит CDC key/value для SR serialization.
 
@@ -408,6 +605,11 @@ def build_cdc_event(row: RowDict, table_meta: TableMeta, cfg: Any) -> Tuple[RowD
         before = _parse_delete_sql(sql_undo)
     else:
         raise RuntimeError(f"Unsupported operation for CDC envelope: {operation!r}")
+
+    # Нормализуем типы parsed row images под metadata таблицы
+    # (особенно важно для NUMBER-колонок: "21" -> 21).
+    before = _coerce_row_image_types(before, table_meta)
+    after = _coerce_row_image_types(after, table_meta)
 
     key_basis = after or before or {}
     key_obj = (
