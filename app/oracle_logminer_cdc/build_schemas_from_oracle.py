@@ -27,6 +27,7 @@ except Exception:  # pragma: no cover
 
 
 def _parse_csv(raw: str) -> List[str]:
+    """Парсит CSV-строку в уникальный список значений (с сохранением порядка)."""
     values: List[str] = []
     for item in raw.split(","):
         normalized = item.strip()
@@ -36,6 +37,7 @@ def _parse_csv(raw: str) -> List[str]:
 
 
 def _sanitize_topic_part(value: str) -> str:
+    """Нормализует часть topic (lowercase + безопасные символы)."""
     chars: List[str] = []
     for ch in value.strip().lower():
         chars.append(ch if (ch.isalnum() or ch in {"-", "_", "."}) else "_")
@@ -44,6 +46,7 @@ def _sanitize_topic_part(value: str) -> str:
 
 
 def _table_to_topic(table_qualified: str, topic_prefix: str, sep: str) -> str:
+    """Преобразует SCHEMA.TABLE в имя topic с заданным префиксом."""
     parts = table_qualified.split(".")
     if len(parts) != 2:
         raise ValueError(f"Expected SCHEMA.TABLE format, got: {table_qualified!r}")
@@ -106,6 +109,7 @@ def _oracle_type_to_json_type(oracle_type: str, nullable: bool) -> Dict[str, Any
 
 
 def _load_table_metadata(conn: oracledb.Connection, owner: str, table: str) -> Dict[str, Any]:
+    """Читает метаданные таблицы из Oracle: колонки + PK."""
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -152,6 +156,7 @@ def _load_table_metadata(conn: oracledb.Connection, owner: str, table: str) -> D
 
 
 def _build_row_object_schema(table_meta: Dict[str, Any]) -> Dict[str, Any]:
+    """Строит JSON Schema объект строки таблицы по списку колонок."""
     properties: Dict[str, Any] = {}
     required: List[str] = []
     for col in table_meta["columns"]:
@@ -171,6 +176,12 @@ def _build_row_object_schema(table_meta: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _build_key_schema(topic: str, table_meta: Dict[str, Any], key_mode: str) -> Dict[str, Any]:
+    """Строит key schema.
+
+    Режимы:
+    - technical: служебный ключ по позиции события в redo потоке;
+    - pk: ключ по первичному ключу таблицы.
+    """
     if key_mode == "technical":
         return {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -214,6 +225,7 @@ def _build_key_schema(topic: str, table_meta: Dict[str, Any], key_mode: str) -> 
 
 
 def _build_value_schema(topic: str, table_meta: Dict[str, Any]) -> Dict[str, Any]:
+    """Строит value schema (CDC envelope: op/source/before/after)."""
     row_schema = _build_row_object_schema(table_meta)
     return {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -244,6 +256,7 @@ def _build_value_schema(topic: str, table_meta: Dict[str, Any]) -> Dict[str, Any
 
 
 def _write_json(path: Path, payload: Dict[str, Any], overwrite: bool) -> str:
+    """Записывает JSON в файл. Возвращает 'write' или 'skip'."""
     if path.exists() and not overwrite:
         return "skip"
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -252,6 +265,7 @@ def _write_json(path: Path, payload: Dict[str, Any], overwrite: bool) -> str:
 
 
 def _post_schema_to_sr(sr_url: str, subject: str, schema_payload: Dict[str, Any], auth: str) -> Dict[str, Any]:
+    """Регистрирует одну схему в SR через REST API `/subjects/<subject>/versions`."""
     body = json.dumps(
         {
             "schemaType": "JSON",
@@ -279,6 +293,7 @@ def _register_schemas(
     value_schema: Dict[str, Any],
     auth: str,
 ) -> None:
+    """Регистрирует пару схем (`-key` и `-value`) для конкретного topic."""
     key_subject = f"{topic}-key"
     value_subject = f"{topic}-value"
     key_result = _post_schema_to_sr(sr_url, key_subject, key_schema, auth)
@@ -288,6 +303,7 @@ def _register_schemas(
 
 
 def _resolve_tables(args_tables: str, args_tables_file: str) -> List[str]:
+    """Разрешает список таблиц из `--tables` или `--tables-file`."""
     if args_tables:
         return _parse_csv(args_tables)
     if args_tables_file:
@@ -302,6 +318,14 @@ def _resolve_tables(args_tables: str, args_tables_file: str) -> List[str]:
 
 
 def main() -> int:
+    """CLI entrypoint.
+
+    Поток выполнения:
+    1) читаем аргументы;
+    2) подключаемся к Oracle;
+    3) генерируем key/value schema файлы;
+    4) опционально регистрируем схемы в SR.
+    """
     parser = argparse.ArgumentParser(description="Build JSON schemas from Oracle metadata.")
     parser.add_argument("--oracle-user", default=os.getenv("ORACLE_USER", ""))
     parser.add_argument("--oracle-password", default=os.getenv("ORACLE_PASSWORD", ""))
