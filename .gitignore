@@ -1,5 +1,6 @@
 .env
 state/*.json
+state/cron-logs/
 .pycache_local/
 schemas/
 certs/

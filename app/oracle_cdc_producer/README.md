@@ -62,6 +62,60 @@ docker compose run --rm oracle-producer-archivelog-sr
      -> save STATE_FILE (/state/*.json)
 ```
 
+## Cron pipeline без make
+
+Рекомендуемая схема:
+- `oracle-schema-build` по редкому расписанию (например, раз в ночь или после DDL);
+- `oracle-producer-archivelog-sr` чаще (например, каждую минуту).
+
+Готовый скрипт:
+- `scripts/cron_cdc.sh`
+- режимы: `producer`, `schema` (`schema-build`), `pipeline`
+
+Примеры режимов:
+
+`<project-dir>` в примерах ниже — путь к каталогу `docker-kafka-clients-confluent-manual-commit`.
+
+Тестовый режим (интеграционный прогон, вручную):
+
+```bash
+cd <project-dir>
+SCHEMA_OVERWRITE=yes SCHEMA_REGISTER_SR= ./scripts/cron_cdc.sh pipeline
+```
+
+Тестовый режим через cron (например, каждые 15 минут):
+
+```cron
+*/15 * * * * SCHEMA_OVERWRITE=yes SCHEMA_REGISTER_SR= \
+  <project-dir>/scripts/cron_cdc.sh pipeline
+```
+
+Прод-режим через cron (рекомендуется 2 отдельные записи):
+
+```cron
+# producer: часто (пример: каждую минуту)
+* * * * * <project-dir>/scripts/cron_cdc.sh producer
+
+# schema-build: редко (пример: раз в день), опционально с регистрацией в SR
+5 2 * * * SCHEMA_OVERWRITE=yes SCHEMA_REGISTER_SR=yes \
+  <project-dir>/scripts/cron_cdc.sh schema
+```
+
+Что делает скрипт:
+- сам переходит в корень проекта;
+- использует `flock` (Linux) для lock-файла `/tmp/oracle-cdc.lock` и не допускает параллельный запуск;
+- пишет логи в `state/cron-logs/*.log`;
+- поддерживает env-overrides: `SCHEMA_OVERWRITE`, `SCHEMA_REGISTER_SR`, `SCHEMA_DSN`, `PRODUCER_DSN`, `LOCK_FILE`, `LOG_FILE`.
+
+Перед этим убедитесь, что builder и producer используют согласованные topic/key/schema параметры.
+
+Важно по Oracle DSN:
+- в текущем стенде обе службы можно запускать на `.../FREE`;
+- это проверено фактическим запуском `oracle-schema-build` и `oracle-producer-archivelog-sr` на `FREE`.
+
+Примечание по SR:
+- если у `oracle-schema-build` включен `REGISTER_SR=yes`, возможен `409 Conflict` при несовместимой эволюции схем в Schema Registry (это не связано с DSN).
+
 ## Parser backend режимы
 
 - `auto` (по умолчанию): сначала `sqlglot`, затем fallback на legacy parser;
