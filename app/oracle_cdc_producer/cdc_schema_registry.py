@@ -88,11 +88,14 @@ class SchemaRuntime:
         return path.read_text(encoding="utf-8")
 
     def _json_serializer(self, schema_str: str) -> Any:
+        # to_dict возвращает объект без преобразований:
+        # мы уже формируем dict в runtime и отдаём его сериализатору как есть.
         return JSONSerializer(
             schema_str=schema_str,
             schema_registry_client=self.client,
             to_dict=lambda obj, _ctx: obj,
             conf={
+                # Флаги ниже синхронизированы с env-параметрами producer-а.
                 "auto.register.schemas": self.cfg.schema_auto_register,
                 "use.latest.version": self.cfg.schema_use_latest_version,
                 "normalize.schemas": self.cfg.schema_normalize,
@@ -101,11 +104,13 @@ class SchemaRuntime:
 
     def key_serializer(self, topic: str) -> Any:
         if topic not in self._key_serializers:
+            # Ленивая инициализация: schema читается/парсится один раз на topic.
             self._key_serializers[topic] = self._json_serializer(self._load_schema_text(topic, "key"))
         return self._key_serializers[topic]
 
     def value_serializer(self, topic: str) -> Any:
         if topic not in self._value_serializers:
+            # Аналогичный lazy-cache для value schema.
             self._value_serializers[topic] = self._json_serializer(self._load_schema_text(topic, "value"))
         return self._value_serializers[topic]
 
@@ -200,6 +205,8 @@ def _build_source_block(row: RowDict) -> RowDict:
     ts_value = row.get("timestamp")
     if isinstance(ts_value, str):
         try:
+            # best-effort: если timestamp не ISO, оставляем ts_ms=None
+            # и не валим весь batch только из-за source.ts_ms.
             ts_ms = int(datetime.fromisoformat(ts_value).timestamp() * 1000)
         except Exception:
             ts_ms = None
@@ -257,6 +264,8 @@ def build_cdc_event(row: RowDict, table_meta: TableMeta, cfg: Any) -> Tuple[RowD
         parser_backend=str(getattr(cfg, "cdc_sql_parser_backend", "auto") or "auto"),
     )
 
+    # Для INSERT берем ключ из after, для DELETE — из before, для UPDATE
+    # приоритет after (но fallback на before сохранён для устойчивости).
     key_basis = after or before or {}
     key_obj = (
         _build_pk_key(key_basis, table_meta)

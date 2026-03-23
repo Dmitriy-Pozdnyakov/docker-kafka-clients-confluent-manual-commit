@@ -110,6 +110,8 @@ def load_config_from_env() -> Config:
     """Собирает runtime-конфиг из env с безопасными дефолтами."""
     broker = os.getenv("KAFKA_BROKER", "").strip()
     if not broker:
+        # BROKER оставлен как legacy alias для обратной совместимости
+        # со старыми env-файлами/скриптами.
         broker = os.getenv("BROKER", "127.0.0.1:19092,127.0.0.1:19093,127.0.0.1:19094").strip()
 
     return Config(
@@ -168,6 +170,7 @@ def validate_config(cfg: Config) -> None:
     if not cfg.kafka_broker:
         missing.append("KAFKA_BROKER or BROKER")
     if missing:
+        # Единая ошибка по всем отсутствующим полям удобнее для first-run setup.
         raise RuntimeError(f"Missing required env vars: {', '.join(missing)}")
 
     if cfg.fetchmany_size <= 0:
@@ -183,6 +186,7 @@ def validate_config(cfg: Config) -> None:
         )
 
     if cfg.cdc_envelope_enabled:
+        # Эти проверки нужны именно для SR-режима; в raw-режиме они не блокируют запуск.
         if not schema_registry_dependencies_available():
             raise RuntimeError("Schema Registry dependencies are unavailable in confluent-kafka package")
         if not cfg.schema_registry_url:

@@ -14,30 +14,59 @@
 
 ## Backlog по этапам
 
-### Этап 1. Быстрый hardening
-- [ ] Атомарное сохранение `STATE_FILE` (temp + fsync + rename).
-- [ ] Fail-fast валидация Kafka security-конфига (SASL/SSL обязательные параметры).
-- [ ] Выравнивание `*.env` и `*.env.example` для SR-режима (DSN, broker, `SCHEMA_DIR`, SR URL).
+### Этап 1. Надежность runtime (P0)
+- [x] Атомарная запись `STATE_FILE` (`tmp -> flush -> fsync -> os.replace`), чтобы watermark не повреждался при kill/restart.
+- [ ] Fail-fast валидация Kafka security-конфига: при `SSL/SASL_*` проверять обязательные `SSL_*`/`KAFKA_SASL_*` поля до старта batch.
+- [ ] Preflight-проверка зависимостей перед чтением LogMiner: доступность Oracle DSN, Kafka broker(s), `SCHEMA_DIR` и schema-файлов для target topic-ов.
+- [ ] Сузить fallback `CDC_PARSE_ERROR_MODE=raw`: деградировать в raw только на parser/schema-mapping ошибках, а не на сетевых/infra ошибках Kafka/SR.
 
-### Этап 2. Качество CDC payload
-- [ ] Нормализация DATE/TIMESTAMP в canonical формат (ISO-8601 UTC) для `before/after`.
-- [ ] Явный маршрут ошибок парсинга (`CDC_PARSE_ERROR_TOPIC`/DLQ), без неявной деградации.
-- [ ] Строгий режим контрактов: при schema mismatch не продвигать `commit_scn`.
+### Этап 2. Контракт схем и Schema Registry (P0/P1)
+- [ ] Зафиксировать единую стратегию источника схем в runtime: `local-only` или `sr-latest`, без смешанного неявного поведения.
+- [ ] Добавить preflight совместимости subject-ов (`<topic>-key`, `<topic>-value`) до запуска producer batch.
+- [ ] В `oracle-schema-build` добавить idempotent режим регистрации: одинаковая схема не считается ошибкой (graceful обработка `409`).
+- [ ] Ввести schema-fingerprint (hash) в логах/отчете запуска для контроля drift между локальными файлами и SR.
 
-### Этап 3. Тестируемость
-- [ ] Unit-тесты SQL parser (INSERT/UPDATE/DELETE, кавычки, `AND`, вложенные функции).
-- [ ] Набор golden fixtures для `sql_redo/sql_undo` из реальных логов.
-- [ ] Интеграционный smoke test: Oracle -> producer -> Kafka (проверка key/value формата).
+### Этап 3. Качество CDC payload (P1)
+- [ ] Нормализовать DATE/TIMESTAMP в canonical формат (ISO-8601 UTC) в `before/after` (без строк `TO_DATE(...)`/`TO_TIMESTAMP(...)`).
+- [ ] Добавить явный маршрут ошибок CDC (`CDC_PARSE_ERROR_TOPIC`/DLQ) с причиной, исходным SQL и контекстом (`schema/table/op/commit_scn`).
+- [ ] Строгий контрактный режим: при schema mismatch/serialization error не продвигать `commit_scn`, чтобы исключить silent data loss.
 
-### Этап 4. Schema Registry и контракт
-- [ ] Полная SR-конфигурация в runtime (auth/ssl parity с schema-builder).
-- [ ] Зафиксировать единую стратегию источника схем (локальные файлы vs SR latest).
-- [ ] Preflight-проверка совместимости subject-ов перед запуском батча.
+### Этап 4. Тестируемость и CI (P1)
+- [ ] Unit-тесты для обоих parser backend-ов (`legacy/sqlglot`) с общим набором кейсов и сравнением expected `before/after`.
+- [ ] Golden fixtures из реальных `sql_redo/sql_undo` (разные типы, кавычки, функции, сложные WHERE) как регрессионный набор.
+- [ ] Интеграционный smoke test `schema-build -> producer -> Kafka` (валидация topic/key/value + watermark update).
+- [ ] Минимальный CI-пайплайн: `py_compile`, parser-tests, smoke тест (опционально nightly).
 
-### Этап 5. Эксплуатация и мониторинг
-- [ ] Структурированные логи (JSON) + стабильные поля для алертов.
-- [ ] Метрики: `rows`, `delivered`, `failed`, `cdc_rows`, `raw_rows`, `cdc_fallback_raw`, `last_commit_scn`.
-- [ ] Короткий runbook восстановления после ошибок (state drift, parser fail spike).
+### Этап 5. Эксплуатация и cron-runner (P2)
+- [ ] Структурированные JSON-логи (опциональный режим) с фиксированными полями для алертов.
+- [ ] Экспорт runtime-метрик (`rows`, `delivered`, `failed`, `cdc_rows`, `raw_rows`, `cdc_fallback_raw`, `last_commit_scn`) в machine-readable формате.
+- [ ] Улучшить `scripts/cron_cdc.sh`: отдельные lock-файлы по режимам (`producer/schema`) и ротация/retention cron-логов.
+- [ ] Короткий runbook восстановления (state drift, SR conflict, parser fail spike, broker недоступен).
+
+### Ближайшие 3 шага (рекомендуемый порядок)
+- [ ] Шаг 1: атомарный `STATE_FILE` + строгая валидация security/preflight.
+- [ ] Шаг 2: idempotent SR-регистрация + preflight совместимости subject-ов.
+- [ ] Шаг 3: DLQ/parse-error topic + интеграционный smoke test для cron pipeline.
+
+## Результат текущей ревизии (2026-03-23)
+
+- Runtime-поток в целом рабочий (`schema-build -> producer -> state`), но есть риск потери watermark при неатомарной записи state.
+- Ветка fallback `CDC_PARSE_ERROR_MODE=raw` сейчас может маскировать не только parser ошибки, но и инфраструктурные проблемы SR/Kafka.
+- Контракт по датам в payload пока нестабилен: `TO_DATE(...)`/`TO_TIMESTAMP(...)` уходят строками и могут конфликтовать с downstream-ожиданиями.
+- В `schema-build` регистрация в SR не idempotent по `409 Conflict`, это мешает безопасному повторному прогону cron/pipeline.
+- Для эксплуатации не хватает формализованных метрик/health-check и CI-проверок регресса parser/backend-ов.
+
+## План внедрения: что и как
+
+| Приоритет | Что добавить | Как реализовать | Где менять | Критерий готовности |
+|---|---|---|---|---|
+| P0 | Атомарный state + защита от битого JSON | Писать `STATE_FILE.tmp` c `flush+fsync`, затем `os.replace`; при битом state поднимать явную ошибку с путем и содержимым | `app/oracle_cdc_producer/producer_archivelog_sr.py` | Kill/restart во время записи не ломает state; повторный старт читает корректный watermark |
+| P0 | Fail-fast security/preflight | В `validate_config` добавить обязательные поля для `SSL/SASL_*`; перед batch делать preflight Oracle/Kafka/SR/schema-dir | `app/oracle_cdc_producer/config.py`, `app/oracle_cdc_producer/producer_archivelog_sr.py`, `app/oracle_cdc_producer/cdc_schema_registry.py` | Ошибки конфигурации ловятся до LogMiner и без частичной обработки батча |
+| P0 | Узкий fallback only для parser-ошибок | Ввести отдельные типы ошибок parser/schema mapping; fallback в raw делать только для них, а SR/Kafka ошибки роняют батч | `app/oracle_cdc_producer/cdc_sql_parser.py`, `app/oracle_cdc_producer/cdc_schema_registry.py`, `app/oracle_cdc_producer/producer_archivelog_sr.py` | При сетевой ошибке Kafka/SR `commit_scn` не продвигается и процесс падает с понятной причиной |
+| P1 | Нормализация DATE/TIMESTAMP | Добавить нормализацию Oracle-дат в canonical ISO-8601 UTC в `before/after`; исходный SQL оставить в raw-контексте ошибки | `app/oracle_cdc_producer/cdc_sql_parser.py`, `app/oracle_cdc_producer/cdc_sql_parser_legacy.py`, `app/oracle_cdc_producer/cdc_sql_parser_sqlglot.py` | В CDC payload нет `TO_DATE(...)`/`TO_TIMESTAMP(...)`, схемы и consumer-парсинг стабильны |
+| P1 | Idempotent SR registration | В schema-build корректно обрабатывать `409` (сравнение/лог "already registered"), чтобы re-run был безопасным | `app/oracle_cdc_schema_build/build_schemas_from_oracle.py` | Повторный `REGISTER_SR=yes` не падает на неизменной схеме |
+| P1 | CI + regression tests | Добавить unit-тесты parser backend-ов и smoke e2e (schema-build -> producer); запускать в CI на каждом push | `app/oracle_cdc_producer/*`, `app/oracle_cdc_schema_build/*`, `.github/workflows/*` (или локальный CI runner) | Есть автоматическая проверка, что parser и pipeline не ломаются при рефакторинге |
+| P2 | Наблюдаемость и cron-hardening | Добавить machine-readable метрики, JSON-логи, отдельные lock-файлы по режимам и retention логов | `scripts/cron_cdc.sh`, `app/oracle_cdc_producer/producer_archivelog_sr.py`, `app/oracle_cdc_producer/README.md` | По логам/метрикам видно, что отправлено, где упало и что нужно восстановить |
 
 ## Журнал выполненных доработок
 
@@ -69,3 +98,8 @@
 | 2026-03-23 | README: примеры test/prod режимов cron | В разделе cron добавлены отдельные примеры для тестового `pipeline` и прод-схемы с двумя записями (`producer` часто, `schema` редко) | `app/oracle_cdc_producer/README.md`, `road-map.md` | Визуальная проверка README |
 | 2026-03-23 | Убраны абсолютные пути из README | В cron/тест-примерах заменены machine-specific пути на шаблон `<project-dir>` для переносимости между окружениями | `app/oracle_cdc_producer/README.md`, `road-map.md` | Визуальная проверка README |
 | 2026-03-23 | Расширена документация SQL parser backend-ов | Для `legacy` и `sqlglot` parser добавлены подробные docstring-и helper-функций и промежуточные комментарии по ключевым шагам разбора (state-machine, before/after, AST traversal) | `app/oracle_cdc_producer/cdc_sql_parser_legacy.py`, `app/oracle_cdc_producer/cdc_sql_parser_sqlglot.py`, `road-map.md` | `PYTHONPYCACHEPREFIX=/tmp/python-pyc-cache python3 -m py_compile ...` |
+| 2026-03-23 | Актуализация roadmap после ревизии проекта | Backlog переработан по приоритетам P0/P1/P2: добавлены concrete шаги по runtime hardening, SR контрактам, payload качеству, CI/тестам и эксплуатации cron pipeline | `road-map.md` | Визуальная проверка обновленного backlog |
+| 2026-03-23 | Детализация roadmap по коду (что/как/где) | По текущей ревизии producer/schema-build/cron добавлена отдельная секция с рисками и таблица внедрения с критериями готовности | `road-map.md` | Визуальная сверка секций и шагов |
+| 2026-03-23 | Внедрена атомарная запись `STATE_FILE` | Реализовано сохранение watermark через `tmp -> flush -> fsync -> os.replace`, добавлена валидация state JSON при загрузке | `app/oracle_cdc_producer/producer_archivelog_sr.py`, `road-map.md` | `PYTHONPYCACHEPREFIX=/tmp/python-pyc-cache python3 -m py_compile app/oracle_cdc_producer/producer_archivelog_sr.py` |
+| 2026-03-23 | Расширены комментарии в ключевых CDC-модулях | Добавлены дополнительные пояснения по fallback parser backend-ов, lazy SR serializer cache и env/validation правилам для более быстрой навигации по коду | `app/oracle_cdc_producer/cdc_sql_parser.py`, `app/oracle_cdc_producer/cdc_schema_registry.py`, `app/oracle_cdc_producer/config.py`, `road-map.md` | `PYTHONPYCACHEPREFIX=/tmp/python-pyc-cache python3 -m py_compile app/oracle_cdc_producer/config.py app/oracle_cdc_producer/cdc_schema_registry.py app/oracle_cdc_producer/cdc_sql_parser.py` |
+| 2026-03-23 | Пошаговые комментарии для атомарной записи state | В блоке atomic state добавлены шаги 1..N для чтения/валидации state и для последовательности `tmp -> flush/fsync -> replace -> fsync(dir)` | `app/oracle_cdc_producer/producer_archivelog_sr.py`, `road-map.md` | `PYTHONPYCACHEPREFIX=/tmp/python-pyc-cache python3 -m py_compile app/oracle_cdc_producer/producer_archivelog_sr.py` |

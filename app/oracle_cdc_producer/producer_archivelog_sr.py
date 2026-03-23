@@ -13,7 +13,9 @@
 """
 
 import json
+import os
 import sys
+import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -47,21 +49,91 @@ def _log(cfg: Config, message: str) -> None:
         print(f"[oracle->kafka:archivelog-sr-cdc] {message}")
 
 
-def _load_state(cfg: Config) -> Dict[str, int]:
+def _load_state(cfg: Config) -> Dict[str, Any]:
     """Читает watermark state; при первом запуске возвращает стартовый SCN из конфига."""
     path = Path(cfg.state_file)
-    if path.exists():
-        with path.open("r", encoding="utf-8") as f:
-            return json.load(f)
-    return {"last_commit_scn": cfg.start_from_commit_scn}
+    # Шаг 1: если state-файла еще нет, стартуем от START_FROM_SCN.
+    if not path.exists():
+        return {"last_commit_scn": cfg.start_from_commit_scn}
+
+    try:
+        # Шаг 2: читаем JSON state целиком.
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"STATE_FILE is not valid JSON: {path} ({exc})") from exc
+
+    # Шаг 3: проверяем форму state-файла.
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"STATE_FILE must contain JSON object, got: {type(payload).__name__}")
+    if "last_commit_scn" not in payload:
+        raise RuntimeError(f"STATE_FILE is missing 'last_commit_scn': {path}")
+
+    try:
+        # Шаг 4: нормализуем тип watermark к int, чтобы дальше не ловить сюрпризы.
+        payload["last_commit_scn"] = int(payload.get("last_commit_scn"))
+    except Exception as exc:
+        raise RuntimeError(f"STATE_FILE has invalid 'last_commit_scn': {payload.get('last_commit_scn')!r}") from exc
+
+    # Шаг 5: возвращаем валидированный state.
+    return payload
+
+
+def _fsync_directory(path: Path) -> None:
+    """Пытается fsync каталога после os.replace для лучшей crash-consistency."""
+    try:
+        # Нужен fsync директории, чтобы операция rename была надежно зафиксирована на диске.
+        dir_fd = os.open(str(path), os.O_RDONLY)
+    except Exception:
+        return
+    try:
+        os.fsync(dir_fd)
+    except Exception:
+        pass
+    finally:
+        os.close(dir_fd)
+
+
+def _atomic_write_json(path: Path, payload: Dict[str, Any]) -> None:
+    """Атомарно пишет JSON: tmp -> flush -> fsync -> os.replace."""
+    # Шаг 1: гарантируем существование целевого каталога.
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # Шаг 2: создаем временный файл в том же каталоге
+    # (это важно для атомарного os.replace на одном файловом разделе).
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            # Шаг 3: пишем JSON payload во временный файл.
+            json.dump(payload, f, ensure_ascii=False)
+            f.write("\n")
+            # Шаг 4: принудительно сбрасываем буферы Python и ОС.
+            f.flush()
+            os.fsync(f.fileno())
+        # Шаг 5: атомарно заменяем старый state новым.
+        os.replace(str(tmp_path), str(path))
+        # Шаг 6: дополнительно fsync каталога после rename.
+        _fsync_directory(path.parent)
+    except Exception:
+        try:
+            # При любой ошибке удаляем temp-файл, чтобы не оставлять мусор.
+            if tmp_path.exists():
+                tmp_path.unlink()
+        except Exception:
+            pass
+        raise
 
 
 def _save_state(cfg: Config, last_commit_scn: int) -> None:
-    """Сохраняет watermark после успешного batch (atomic rename тут не делаем, оставляем простой JSON)."""
+    """Сохраняет watermark после успешного batch атомарной записью."""
     path = Path(cfg.state_file)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as f:
-        json.dump({"last_commit_scn": last_commit_scn, "updated_at": datetime.now(timezone.utc).isoformat()}, f)
+    # Собираем компактный state и передаем его в единый атомарный writer.
+    _atomic_write_json(
+        path,
+        {
+            "last_commit_scn": int(last_commit_scn),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        },
+    )
 
 
 def _build_kafka_producer(cfg: Config) -> Producer:

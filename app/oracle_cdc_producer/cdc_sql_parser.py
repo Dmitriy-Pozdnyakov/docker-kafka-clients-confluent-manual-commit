@@ -46,10 +46,13 @@ _NUMERIC_ORACLE_TYPE_PREFIXES = (
 
 
 def _normalize_column_name(raw: str) -> str:
+    # Приводим имена к единому виду, чтобы сравнение колонок
+    # не зависело от кавычек/регистра из SQL_REDO/SQL_UNDO.
     return str(raw).strip().strip('"').upper()
 
 
 def _parse_numeric_token(token: str) -> Any:
+    # Мягкий coercion: если токен не "чистое" число, возвращаем строку как есть.
     if _INT_TOKEN_RE.fullmatch(token):
         try:
             return int(token)
@@ -64,6 +67,8 @@ def _parse_numeric_token(token: str) -> Any:
 
 
 def _is_numeric_oracle_type(oracle_type: str) -> bool:
+    # Проверяем именно prefix, т.к. Oracle type часто приходит с суффиксами,
+    # например NUMBER(10,2) или FLOAT(126).
     normalized = str(oracle_type or "").upper()
     return any(normalized.startswith(prefix) for prefix in _NUMERIC_ORACLE_TYPE_PREFIXES)
 
@@ -73,11 +78,14 @@ def _coerce_value_by_oracle_type(value: Any, oracle_type: str) -> Any:
     if value is None:
         return None
     if not _is_numeric_oracle_type(oracle_type):
+        # Для нечисловых типов ничего не трогаем: даты/строки/RAW остаются как распарсил backend.
         return value
     if isinstance(value, (int, float)):
         return value
     if not isinstance(value, str):
         return value
+    # Часто parser отдает строку (например из quoted literal), здесь пробуем
+    # безопасно до-привести к int/float.
     return _parse_numeric_token(value.strip())
 
 
@@ -113,6 +121,7 @@ def _parse_with_backend(
 def _resolve_backends(parser_backend: str) -> Tuple[str, ...]:
     backend = str(parser_backend or "auto").strip().lower()
     if backend == "legacy_first":
+        # Исторический alias для обратной совместимости с env/config.
         backend = "auto_legacy_first"
 
     if backend not in {"auto", "auto_legacy_first", "legacy", "sqlglot"}:
@@ -141,6 +150,8 @@ def _parse_operation_images(
     raw_backend = str(parser_backend or "auto").strip().lower()
     if raw_backend == "legacy_first":
         raw_backend = "auto_legacy_first"
+    # explicit_backend=True означает "fallback запрещен":
+    # если пользователь явно выбрал backend, не скрываем ошибку.
     explicit_backend = raw_backend not in {"auto", "auto_legacy_first"}
 
     last_error: Optional[Exception] = None
@@ -151,6 +162,7 @@ def _parse_operation_images(
             last_error = exc
             if explicit_backend:
                 raise
+            # Для auto-режима пробуем следующий backend (fallback).
 
     if last_error is not None:
         raise last_error
