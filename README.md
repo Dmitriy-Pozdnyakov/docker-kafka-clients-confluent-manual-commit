@@ -15,6 +15,18 @@ cp app/oracle_cdc_schema_build/env/oracle-schema-build.env.example \
    app/oracle_cdc_schema_build/env/oracle-schema-build.env
 ```
 
+## Разделение Oracle-кредов
+
+В проекте используются 2 независимых набора Oracle-кредов:
+
+1. `oracle-producer-archivelog-sr` (LogMiner runtime):
+- пользователь/пароль для чтения redo stream (`C##LOGMINER`);
+- DSN: `.../FREE` (CDB service).
+
+2. `oracle-schema-build` (metadata build):
+- пользователь/пароль для чтения метаданных таблиц (`ALL_TAB_COLUMNS`/PK);
+- DSN: `.../FREEPDB1` (PDB service, где находятся `HR.*` таблицы).
+
 ## Процесс 1: создание схем
 
 ```bash

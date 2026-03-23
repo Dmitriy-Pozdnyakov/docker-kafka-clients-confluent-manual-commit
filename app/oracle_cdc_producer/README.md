@@ -110,8 +110,9 @@ SCHEMA_OVERWRITE=yes SCHEMA_REGISTER_SR= ./scripts/cron_cdc.sh pipeline
 Перед этим убедитесь, что builder и producer используют согласованные topic/key/schema параметры.
 
 Важно по Oracle DSN:
-- в текущем стенде обе службы можно запускать на `.../FREE`;
-- это проверено фактическим запуском `oracle-schema-build` и `oracle-producer-archivelog-sr` на `FREE`.
+- креды/DSN producer используются только для LogMiner runtime (`oracle-producer-archivelog-sr`);
+- для producer используем `ORACLE_DSN=.../FREE` и пользователя `C##LOGMINER`;
+- schema-builder использует отдельные креды и отдельный DSN `.../FREEPDB1` (где живут `HR.*` таблицы).
 
 Примечание по SR:
 - если у `oracle-schema-build` включен `REGISTER_SR=yes`, возможен `409 Conflict` при несовместимой эволюции схем в Schema Registry (это не связано с DSN).
