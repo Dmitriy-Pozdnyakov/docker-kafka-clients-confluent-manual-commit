@@ -24,24 +24,29 @@ except Exception:  # pragma: no cover
 
 RowDict = Dict[str, Any]
 
+# Числовые literal helper-ы (используются для мягкого coercion строковых токенов).
 _INT_TOKEN_RE = re.compile(r"[-+]?\d+")
 _FLOAT_TOKEN_RE = re.compile(r"[-+]?\d+\.\d+")
 
 
 def sqlglot_dependencies_available() -> bool:
+    """Возвращает True, если optional dependency `sqlglot` доступна."""
     return sqlglot is not None and _sg_exp is not None
 
 
 def _require_available() -> None:
+    """Fail-fast guard для путей, где sqlglot обязателен."""
     if not sqlglot_dependencies_available():
         raise RuntimeError("Parser backend 'sqlglot' requested, but sqlglot dependency is not installed")
 
 
 def _normalize_column_name(raw: str) -> str:
+    """Нормализует имя колонки к UPPER без кавычек."""
     return str(raw).strip().strip('"').upper()
 
 
 def _parse_numeric_token(token: str) -> Any:
+    """Пытается преобразовать строковый токен в int/float, иначе возвращает как есть."""
     if _INT_TOKEN_RE.fullmatch(token):
         try:
             return int(token)
@@ -56,6 +61,7 @@ def _parse_numeric_token(token: str) -> Any:
 
 
 def _sql_literal_to_python(token: str) -> Any:
+    """Преобразует SQL literal в python-представление для CDC row-image."""
     token = token.strip()
     if not token:
         return None
@@ -71,6 +77,7 @@ def _sql_literal_to_python(token: str) -> Any:
 
 
 def _parse_one(sql_text: str, stmt_kind: str):
+    """Парсит SQL в AST конкретного stmt_kind, нормализуя текст ошибки."""
     _require_available()
     try:
         return sqlglot.parse_one(sql_text, read="oracle")
@@ -79,6 +86,7 @@ def _parse_one(sql_text: str, stmt_kind: str):
 
 
 def _to_sql(expr: Any) -> str:
+    """Безопасно сериализует AST node обратно в SQL-фрагмент."""
     if expr is None:
         return ""
     try:
@@ -88,6 +96,7 @@ def _to_sql(expr: Any) -> str:
 
 
 def _column_name(expr: Any) -> Optional[str]:
+    """Извлекает и нормализует имя колонки из Column/Identifier узла."""
     if expr is None or not sqlglot_dependencies_available():
         return None
     if isinstance(expr, _sg_exp.Column):
@@ -104,6 +113,7 @@ def _column_name(expr: Any) -> Optional[str]:
 
 
 def _expr_to_python(expr: Any) -> Any:
+    """Преобразует AST expression в python value для payload."""
     _require_available()
     if expr is None:
         return None
@@ -120,6 +130,7 @@ def _expr_to_python(expr: Any) -> Any:
 
 
 def _assignment_pair(expr: Any) -> Optional[Tuple[str, Any]]:
+    """Пытается извлечь пару `COLUMN -> value` из assignment/equality узла."""
     if expr is None or not hasattr(expr, "args"):
         return None
     left = expr.args.get("this")
@@ -131,8 +142,10 @@ def _assignment_pair(expr: Any) -> Optional[Tuple[str, Any]]:
 
 
 def _collect_where_pairs(expr: Any, out: RowDict) -> None:
+    """Рекурсивно собирает простые equality-пары из WHERE дерева."""
     if expr is None or not sqlglot_dependencies_available():
         return
+    # Спускаемся до "плоских" сравнений вида COL = LITERAL.
     if isinstance(expr, _sg_exp.Where):
         _collect_where_pairs(expr.args.get("this"), out)
         return
@@ -144,12 +157,14 @@ def _collect_where_pairs(expr: Any, out: RowDict) -> None:
         _collect_where_pairs(expr.args.get("expression"), out)
         return
 
+    # Leaf-case: извлекаем пару, если узел похож на assignment/equality.
     pair = _assignment_pair(expr)
     if pair:
         out[pair[0]] = pair[1]
 
 
 def _extract_insert_columns(insert_ast: Any) -> List[str]:
+    """Извлекает список колонок из INSERT AST."""
     target = insert_ast.args.get("this")
     schema_expr = target if isinstance(target, _sg_exp.Schema) else insert_ast.find(_sg_exp.Schema)
     if schema_expr is None:
@@ -166,6 +181,7 @@ def _extract_insert_columns(insert_ast: Any) -> List[str]:
 
 
 def _extract_insert_values(insert_ast: Any) -> List[Any]:
+    """Извлекает один VALUES-row из INSERT AST и конвертирует значения."""
     values_expr = insert_ast.find(_sg_exp.Values)
     if values_expr is None or not values_expr.expressions:
         raise RuntimeError("INSERT parser mismatch: VALUES clause is not parenthesized")
@@ -181,6 +197,7 @@ def _extract_insert_values(insert_ast: Any) -> List[Any]:
 
 
 def _parse_insert_sql(sql_redo: str) -> RowDict:
+    """Парсит INSERT SQL_REDO и возвращает row-image `column -> value`."""
     ast = _parse_one(sql_redo, "INSERT")
     if not isinstance(ast, _sg_exp.Insert):
         raise RuntimeError("Unsupported INSERT SQL_REDO pattern for prototype parser")
@@ -193,6 +210,7 @@ def _parse_insert_sql(sql_redo: str) -> RowDict:
 
 
 def _collect_update_set_pairs(update_ast: Any) -> RowDict:
+    """Собирает пары из секции SET у UPDATE."""
     out: RowDict = {}
     for expr in update_ast.args.get("expressions") or []:
         pair = _assignment_pair(expr)
@@ -202,14 +220,17 @@ def _collect_update_set_pairs(update_ast: Any) -> RowDict:
 
 
 def _parse_update_sql(sql_redo: str, sql_undo: str) -> Tuple[RowDict, RowDict]:
+    """Строит before/after для UPDATE из redo и undo AST."""
     redo_ast = _parse_one(sql_redo, "UPDATE")
     undo_ast = _parse_one(sql_undo, "UPDATE")
     if not isinstance(redo_ast, _sg_exp.Update) or not isinstance(undo_ast, _sg_exp.Update):
         raise RuntimeError("Unsupported UPDATE SQL pattern for prototype parser")
 
+    # before = undo SET + undo WHERE.
     before_row = _collect_update_set_pairs(undo_ast)
     _collect_where_pairs(undo_ast.args.get("where"), before_row)
 
+    # after = before + redo SET/WHERE.
     after_row = dict(before_row)
     after_row.update(_collect_update_set_pairs(redo_ast))
     _collect_where_pairs(redo_ast.args.get("where"), after_row)
@@ -217,7 +238,7 @@ def _parse_update_sql(sql_redo: str, sql_undo: str) -> Tuple[RowDict, RowDict]:
 
 
 def _parse_delete_sql(sql_undo: str) -> RowDict:
-    # Для DELETE ожидаем, что sql_undo будет INSERT ... VALUES (...).
+    """Для DELETE восстанавливает row image из SQL_UNDO (ожидаем INSERT ... VALUES ...)."""
     return _parse_insert_sql(sql_undo)
 
 
@@ -236,4 +257,3 @@ def parse_operation_images_sqlglot(
     if op == "DELETE":
         return "d", _parse_delete_sql(sql_undo), None
     raise RuntimeError(f"Unsupported operation for CDC envelope: {op!r}")
-

@@ -18,6 +18,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 RowDict = Dict[str, Any]
 
+# Регулярки для "быстрого пути" по простым SQL-шаблонам LogMiner.
 _INSERT_HEAD_RE = re.compile(
     r"insert\s+into\s+.+?\((?P<columns>.+?)\)\s+values\s*",
     flags=re.IGNORECASE | re.DOTALL,
@@ -33,16 +34,19 @@ _FLOAT_TOKEN_RE = re.compile(r"[-+]?\d+\.\d+")
 
 
 def _normalize_column_name(raw: str) -> str:
+    """Нормализует имя колонки к UPPER без кавычек."""
     return str(raw).strip().strip('"').upper()
 
 
 def _append_buf_if_not_empty(buf: List[str], out: List[str]) -> None:
+    """Сливает буфер в выходной список, если токен непустой."""
     token = "".join(buf).strip()
     if token:
         out.append(token)
 
 
 def _is_and_separator(text: str, index: int) -> bool:
+    """Проверяет, что в позиции index находится top-level разделитель AND."""
     if text[index : index + 3].upper() != "AND":
         return False
     prev_ok = index == 0 or text[index - 1].isspace()
@@ -57,6 +61,9 @@ def _split_top_level_sql(text: str, split_on_and: bool) -> List[str]:
     in_string = False
     paren_depth = 0
 
+    # Простой state-machine сканер:
+    # - in_string не дает резать внутри литералов;
+    # - paren_depth не дает резать внутри скобок/функций.
     i = 0
     n = len(text)
     while i < n:
@@ -95,6 +102,7 @@ def _split_top_level_sql(text: str, split_on_and: bool) -> List[str]:
                     i += 3
                     continue
 
+        # Обычный символ текущего токена.
         buf.append(ch)
         i += 1
 
@@ -103,14 +111,17 @@ def _split_top_level_sql(text: str, split_on_and: bool) -> List[str]:
 
 
 def _split_csv_sql(text: str) -> List[str]:
+    """Делит CSV-подобный SQL список по top-level запятым."""
     return _split_top_level_sql(text, split_on_and=False)
 
 
 def _split_assignment_items(text: str) -> List[str]:
+    """Делит assignment-clause по top-level AND и запятым."""
     return _split_top_level_sql(text, split_on_and=True)
 
 
 def _parse_numeric_token(token: str) -> Any:
+    """Пытается преобразовать строковый токен в int/float, иначе возвращает как есть."""
     if _INT_TOKEN_RE.fullmatch(token):
         try:
             return int(token)
@@ -125,6 +136,7 @@ def _parse_numeric_token(token: str) -> Any:
 
 
 def _sql_literal_to_python(token: str) -> Any:
+    """Преобразует SQL literal в Python-значение (ограниченный набор для CDC прототипа)."""
     token = token.strip()
     if not token:
         return None
@@ -142,6 +154,7 @@ def _sql_literal_to_python(token: str) -> Any:
 
 
 def _parse_assignment_map(clause: str) -> RowDict:
+    """Разбирает `col=value` выражения в словарь `COLUMN -> value`."""
     result: RowDict = {}
     for item in _split_assignment_items(clause):
         match = _ASSIGNMENT_RE.match(item.strip())
@@ -153,6 +166,7 @@ def _parse_assignment_map(clause: str) -> RowDict:
 
 
 def _extract_parenthesized_content(text: str, open_paren_idx: int) -> str:
+    """Возвращает содержимое скобок `( ... )`, корректно проходя строки и вложенность."""
     if open_paren_idx < 0 or open_paren_idx >= len(text) or text[open_paren_idx] != "(":
         raise RuntimeError("Parenthesized SQL parser: expected '(' at open_paren_idx")
 
@@ -206,7 +220,9 @@ def _parse_insert_sql(sql_redo: str) -> RowDict:
     if not match:
         raise RuntimeError("Unsupported INSERT SQL_REDO pattern for prototype parser")
 
+    # 1) Извлекаем список колонок.
     columns = [_normalize_column_name(part) for part in _split_csv_sql(match.group("columns"))]
+    # 2) Извлекаем VALUES(...) и переводим literal в python-представление.
     values_part = sql_text[match.end() :].lstrip()
     if not values_part.startswith("("):
         raise RuntimeError("INSERT parser mismatch: VALUES clause is not parenthesized")
@@ -224,10 +240,12 @@ def _parse_update_sql(sql_redo: str, sql_undo: str) -> Tuple[RowDict, RowDict]:
     if not redo_match or not undo_match:
         raise RuntimeError("Unsupported UPDATE SQL pattern for prototype parser")
 
+    # before = значения "до изменений" (берем из undo SET + undo WHERE).
     before_row: RowDict = {}
     before_row.update(_parse_assignment_map(undo_match.group("set_clause")))
     before_row.update(_parse_assignment_map(undo_match.group("where_clause")))
 
+    # after = before + актуальные значения из redo.
     after_row = dict(before_row)
     after_row.update(_parse_assignment_map(redo_match.group("set_clause")))
     after_row.update(_parse_assignment_map(redo_match.group("where_clause")))
@@ -235,7 +253,7 @@ def _parse_update_sql(sql_redo: str, sql_undo: str) -> Tuple[RowDict, RowDict]:
 
 
 def _parse_delete_sql(sql_undo: str) -> RowDict:
-    # Для DELETE ожидаем, что sql_undo будет INSERT ... VALUES (...).
+    """Для DELETE восстанавливает row image из SQL_UNDO (ожидаем INSERT ... VALUES ...)."""
     return _parse_insert_sql(sql_undo)
 
 
@@ -254,4 +272,3 @@ def parse_operation_images_legacy(
     if op == "DELETE":
         return "d", _parse_delete_sql(sql_undo), None
     raise RuntimeError(f"Unsupported operation for CDC envelope: {op!r}")
-
