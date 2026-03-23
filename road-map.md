@@ -22,8 +22,8 @@
 
 ### Этап 2. Контракт схем и Schema Registry (P0/P1)
 - [ ] Зафиксировать единую стратегию источника схем в runtime: `local-only` или `sr-latest`, без смешанного неявного поведения.
-- [ ] Добавить preflight совместимости subject-ов (`<topic>-key`, `<topic>-value`) до запуска producer batch.
-- [ ] В `oracle-schema-build` добавить idempotent режим регистрации: одинаковая схема не считается ошибкой (graceful обработка `409`).
+- [x] Добавить preflight совместимости subject-ов (`<topic>-key`, `<topic>-value`) до запуска producer batch.
+- [x] В `oracle-schema-build` добавить idempotent режим регистрации: одинаковая схема не считается ошибкой (graceful обработка `409`).
 - [ ] Ввести schema-fingerprint (hash) в логах/отчете запуска для контроля drift между локальными файлами и SR.
 
 ### Этап 3. Качество CDC payload (P1)
@@ -45,7 +45,7 @@
 
 ### Ближайшие 3 шага (рекомендуемый порядок)
 - [ ] Шаг 1: атомарный `STATE_FILE` + строгая валидация security/preflight.
-- [ ] Шаг 2: idempotent SR-регистрация + preflight совместимости subject-ов.
+- [x] Шаг 2: idempotent SR-регистрация + preflight совместимости subject-ов.
 - [ ] Шаг 3: DLQ/parse-error topic + интеграционный smoke test для cron pipeline.
 
 ## Результат текущей ревизии (2026-03-23)
@@ -103,3 +103,5 @@
 | 2026-03-23 | Внедрена атомарная запись `STATE_FILE` | Реализовано сохранение watermark через `tmp -> flush -> fsync -> os.replace`, добавлена валидация state JSON при загрузке | `app/oracle_cdc_producer/producer_archivelog_sr.py`, `road-map.md` | `PYTHONPYCACHEPREFIX=/tmp/python-pyc-cache python3 -m py_compile app/oracle_cdc_producer/producer_archivelog_sr.py` |
 | 2026-03-23 | Расширены комментарии в ключевых CDC-модулях | Добавлены дополнительные пояснения по fallback parser backend-ов, lazy SR serializer cache и env/validation правилам для более быстрой навигации по коду | `app/oracle_cdc_producer/cdc_sql_parser.py`, `app/oracle_cdc_producer/cdc_schema_registry.py`, `app/oracle_cdc_producer/config.py`, `road-map.md` | `PYTHONPYCACHEPREFIX=/tmp/python-pyc-cache python3 -m py_compile app/oracle_cdc_producer/config.py app/oracle_cdc_producer/cdc_schema_registry.py app/oracle_cdc_producer/cdc_sql_parser.py` |
 | 2026-03-23 | Пошаговые комментарии для атомарной записи state | В блоке atomic state добавлены шаги 1..N для чтения/валидации state и для последовательности `tmp -> flush/fsync -> replace -> fsync(dir)` | `app/oracle_cdc_producer/producer_archivelog_sr.py`, `road-map.md` | `PYTHONPYCACHEPREFIX=/tmp/python-pyc-cache python3 -m py_compile app/oracle_cdc_producer/producer_archivelog_sr.py` |
+| 2026-03-23 | Реализован Шаг 2: idempotent SR + preflight subject-ов | В schema-build добавлена idempotent SR-регистрация с обработкой `409` (same schema -> already-registered), в producer добавлен preflight `<topic>-key/value` по SR compatibility API (initial + lazy first-use) | `app/oracle_cdc_schema_build/build_schemas_from_oracle.py`, `app/oracle_cdc_producer/cdc_schema_registry.py`, `app/oracle_cdc_producer/producer_archivelog_sr.py`, `road-map.md` | `PYTHONPYCACHEPREFIX=/tmp/python-pyc-cache python3 -m py_compile app/oracle_cdc_schema_build/build_schemas_from_oracle.py app/oracle_cdc_producer/cdc_schema_registry.py app/oracle_cdc_producer/producer_archivelog_sr.py` |
+| 2026-03-23 | Добавлены пошаговые комментарии в функции Step 2 | В SR-idempotent и SR-preflight функциях добавлены промежуточные комментарии по шагам (endpoint/body/request, обработка 409/404, сравнение схем, кэш preflight topic) | `app/oracle_cdc_schema_build/build_schemas_from_oracle.py`, `app/oracle_cdc_producer/cdc_schema_registry.py`, `road-map.md` | `PYTHONPYCACHEPREFIX=/tmp/python-pyc-cache python3 -m py_compile app/oracle_cdc_schema_build/build_schemas_from_oracle.py app/oracle_cdc_producer/cdc_schema_registry.py` |

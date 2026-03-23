@@ -395,6 +395,43 @@ def _resolve_topic(cfg: Config, row: Dict[str, Any]) -> str:
     return cfg.topic_separator.join(parts)
 
 
+def _topic_from_qualified_table(cfg: Config, qualified_table: str) -> str:
+    """Строит target topic из строки `SCHEMA.TABLE` по текущим правилам роутинга."""
+    parts = str(qualified_table or "").split(".", 1)
+    if len(parts) != 2 or not parts[0] or not parts[1]:
+        raise RuntimeError(f"CDC_SUPPORTED_TABLES item must be in SCHEMA.TABLE format: {qualified_table!r}")
+    return _resolve_topic(
+        cfg,
+        {
+            "seg_owner": parts[0],
+            "table_name": parts[1],
+        },
+    )
+
+
+def _collect_initial_cdc_preflight_topics(cfg: Config) -> List[str]:
+    """Определяет список topic-ов для preflight до запуска batch.
+
+    Сценарии:
+    - single-topic: всегда один `cfg.kafka_topic`;
+    - topic-per-table + заполнен CDC_SUPPORTED_TABLES: preflight всех topic-ов из whitelist;
+    - topic-per-table + пустой whitelist: full preflight заранее невозможен (делаем lazy на first-use).
+    """
+    if not cfg.cdc_envelope_enabled:
+        return []
+    if not cfg.topic_per_table:
+        return [cfg.kafka_topic]
+    if not cfg.cdc_supported_tables:
+        return []
+
+    topics: List[str] = []
+    for qualified_table in cfg.cdc_supported_tables:
+        topic = _topic_from_qualified_table(cfg, qualified_table)
+        if topic not in topics:
+            topics.append(topic)
+    return topics
+
+
 def _produce_with_backpressure(
     cfg: Config,
     producer: Producer,
@@ -479,6 +516,19 @@ def run_once(cfg: Config) -> Dict[str, Any]:
 
     producer = _build_kafka_producer(cfg)
     schema_runtime = SchemaRuntime(cfg)
+
+    initial_preflight_topics = _collect_initial_cdc_preflight_topics(cfg)
+    if cfg.cdc_envelope_enabled:
+        if initial_preflight_topics:
+            for topic in initial_preflight_topics:
+                schema_runtime.preflight_topic(topic)
+            _log(cfg, f"sr preflight topics: {','.join(initial_preflight_topics)}")
+        elif cfg.topic_per_table:
+            _log(
+                cfg,
+                "sr preflight is deferred to first-use topics "
+                "(topic_per_table=true and CDC_SUPPORTED_TABLES is empty)",
+            )
 
     delivered = 0
     failed = 0
@@ -566,6 +616,9 @@ def run_once(cfg: Config) -> Dict[str, Any]:
             # - Иначе raw path (JSON-слепок строки LogMiner).
             use_cdc = cfg.cdc_envelope_enabled and is_cdc_table_enabled(cfg, row)
             if use_cdc:
+                # Проверяем schema subject-ы до первой отправки в конкретный topic.
+                # Это fail-fast preflight для динамических topic-ов.
+                schema_runtime.preflight_topic(topic)
                 table_meta = load_table_metadata(conn, str(row.get("seg_owner", "")), str(row.get("table_name", "")))
                 try:
                     retries, waited = _produce_cdc_event(cfg, producer, topic, row, table_meta, schema_runtime, on_delivery)

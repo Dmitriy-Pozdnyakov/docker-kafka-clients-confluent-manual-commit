@@ -16,6 +16,7 @@ import base64
 import json
 import os
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -264,26 +265,128 @@ def _write_json(path: Path, payload: Dict[str, Any], overwrite: bool) -> str:
     return "write"
 
 
-def _post_schema_to_sr(sr_url: str, subject: str, schema_payload: Dict[str, Any], auth: str) -> Dict[str, Any]:
-    """Регистрирует одну схему в SR через REST API `/subjects/<subject>/versions`."""
-    body = json.dumps(
-        {
-            "schemaType": "JSON",
-            "schema": json.dumps(schema_payload, ensure_ascii=False),
-        },
-        ensure_ascii=False,
-    ).encode("utf-8")
-    endpoint = sr_url.rstrip("/") + f"/subjects/{subject}/versions"
+def _sr_request_json(
+    sr_url: str,
+    path: str,
+    method: str,
+    auth: str,
+    payload: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Выполняет JSON-запрос к SR и возвращает JSON-ответ (или `{}`)."""
+    # Шаг 1: собираем полный endpoint (base URL + относительный path).
+    endpoint = sr_url.rstrip("/") + path
+    # Шаг 2: если есть payload, сериализуем его в JSON body.
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8") if payload is not None else None
 
-    req = urllib.request.Request(endpoint, data=body, method="POST")
-    req.add_header("Content-Type", "application/vnd.schemaregistry.v1+json")
+    # Шаг 3: формируем HTTP request + необходимые заголовки.
+    req = urllib.request.Request(endpoint, data=body, method=method.upper())
+    if body is not None:
+        req.add_header("Content-Type", "application/vnd.schemaregistry.v1+json")
     if auth:
+        # SR Basic auth ожидает base64(user:password).
         token = base64.b64encode(auth.encode("utf-8")).decode("ascii")
         req.add_header("Authorization", f"Basic {token}")
 
+    # Шаг 4: выполняем запрос и парсим JSON-ответ.
     with urllib.request.urlopen(req, timeout=30) as resp:
-        payload = resp.read().decode("utf-8")
-        return json.loads(payload) if payload else {}
+        raw = resp.read().decode("utf-8")
+        return json.loads(raw) if raw else {}
+
+
+def _schema_payload_to_sr_text(schema_payload: Dict[str, Any]) -> str:
+    """Преобразует schema payload в строковый JSON, как ожидает SR поле `schema`."""
+    return json.dumps(schema_payload, ensure_ascii=False)
+
+
+def _schema_text_matches_payload(sr_schema_text: str, local_schema_payload: Dict[str, Any]) -> bool:
+    """Сравнивает схему из SR (`schema`-строка) с локальным payload словарем."""
+    try:
+        # Нормальный путь: сравниваем как dict-объекты (порядок ключей не важен).
+        sr_obj = json.loads(sr_schema_text)
+    except Exception:
+        # Fallback: если SR вернул неожиданную строку, сравниваем как есть.
+        return sr_schema_text.strip() == _schema_payload_to_sr_text(local_schema_payload).strip()
+    return sr_obj == local_schema_payload
+
+
+def _post_schema_to_sr(sr_url: str, subject: str, schema_payload: Dict[str, Any], auth: str) -> Dict[str, Any]:
+    """Регистрирует одну схему в SR через `/subjects/<subject>/versions`."""
+    # Subject может содержать точки/спецсимволы, URL-экранируем обязательно.
+    subject_q = urllib.parse.quote(subject, safe="")
+    return _sr_request_json(
+        sr_url=sr_url,
+        path=f"/subjects/{subject_q}/versions",
+        method="POST",
+        auth=auth,
+        payload={
+            "schemaType": "JSON",
+            "schema": _schema_payload_to_sr_text(schema_payload),
+        },
+    )
+
+
+def _get_latest_subject_schema(sr_url: str, subject: str, auth: str) -> Dict[str, Any]:
+    """Читает latest schema для subject из SR."""
+    subject_q = urllib.parse.quote(subject, safe="")
+    return _sr_request_json(
+        sr_url=sr_url,
+        path=f"/subjects/{subject_q}/versions/latest",
+        method="GET",
+        auth=auth,
+        payload=None,
+    )
+
+
+def _register_schema_idempotent(
+    sr_url: str,
+    subject: str,
+    schema_payload: Dict[str, Any],
+    auth: str,
+) -> Dict[str, Any]:
+    """Idempotent registration:
+    - успешный POST -> `status=registered`;
+    - HTTP 409 + identical latest schema -> `status=already-registered`;
+    - HTTP 409 + different latest schema -> ошибка.
+    """
+    try:
+        # Шаг 1: обычная попытка регистрации новой версии схемы.
+        result = _post_schema_to_sr(sr_url, subject, schema_payload, auth)
+        return {
+            "status": "registered",
+            "id": result.get("id"),
+        }
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="ignore")
+        if exc.code != 409:
+            # Любая ошибка кроме "конфликт совместимости" пробрасывается как runtime-ошибка.
+            raise RuntimeError(f"Schema Registry HTTP error for subject={subject}: {exc.code} {body}") from exc
+
+        # Шаг 2 (409): читаем latest subject schema, чтобы отличить
+        # "схема уже зарегистрирована" от реального конфликта.
+        try:
+            latest = _get_latest_subject_schema(sr_url, subject, auth)
+        except urllib.error.HTTPError as latest_exc:
+            latest_body = latest_exc.read().decode("utf-8", errors="ignore")
+            raise RuntimeError(
+                f"Schema Registry 409 for subject={subject}, and latest schema read failed: "
+                f"{latest_exc.code} {latest_body}"
+            ) from latest_exc
+
+        # Шаг 3: сравниваем latest SR schema с локальной схемой.
+        latest_schema_text = str(latest.get("schema") or "")
+        if _schema_text_matches_payload(latest_schema_text, schema_payload):
+            # Идемпотентный случай: локальная схема уже фактически применена.
+            return {
+                "status": "already-registered",
+                "id": latest.get("id"),
+                "version": latest.get("version"),
+            }
+
+        # Иначе это реальная несовместимость/конфликт эволюции схем.
+        raise RuntimeError(
+            f"Schema Registry rejected schema for subject={subject} with HTTP 409 "
+            "(latest subject schema differs from local payload)."
+        ) from exc
 
 
 def _register_schemas(
@@ -294,12 +397,15 @@ def _register_schemas(
     auth: str,
 ) -> None:
     """Регистрирует пару схем (`-key` и `-value`) для конкретного topic."""
+    # Для одного topic всегда работаем парой subject-ов.
     key_subject = f"{topic}-key"
     value_subject = f"{topic}-value"
-    key_result = _post_schema_to_sr(sr_url, key_subject, key_schema, auth)
-    value_result = _post_schema_to_sr(sr_url, value_subject, value_schema, auth)
-    print(f"[oracle-schema-build] SR registered {key_subject}: {key_result}")
-    print(f"[oracle-schema-build] SR registered {value_subject}: {value_result}")
+
+    # Каждая регистрация сама idempotent и безопасна для повторного запуска.
+    key_result = _register_schema_idempotent(sr_url, key_subject, key_schema, auth)
+    value_result = _register_schema_idempotent(sr_url, value_subject, value_schema, auth)
+    print(f"[oracle-schema-build] SR {key_result['status']} {key_subject}: {key_result}")
+    print(f"[oracle-schema-build] SR {value_result['status']} {value_subject}: {value_result}")
 
 
 def _resolve_tables(args_tables: str, args_tables_file: str) -> List[str]:
@@ -384,11 +490,7 @@ def main() -> int:
                     print(f"[oracle-schema-build] skip   {path} (exists)")
 
             if args.register_sr:
-                try:
-                    _register_schemas(args.sr_url, topic, key_schema, value_schema, args.sr_auth)
-                except urllib.error.HTTPError as exc:
-                    body = exc.read().decode("utf-8", errors="ignore")
-                    raise RuntimeError(f"Schema Registry HTTP error for topic={topic}: {exc.code} {body}") from exc
+                _register_schemas(args.sr_url, topic, key_schema, value_schema, args.sr_auth)
 
     finally:
         conn.close()

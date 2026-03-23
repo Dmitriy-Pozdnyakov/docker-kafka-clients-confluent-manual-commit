@@ -18,6 +18,10 @@
 
 from __future__ import annotations
 
+import json
+import urllib.error
+import urllib.parse
+import urllib.request
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -68,6 +72,7 @@ class SchemaRuntime:
         self.cfg = cfg
         self._key_serializers: Dict[str, Any] = {}
         self._value_serializers: Dict[str, Any] = {}
+        self._preflight_topics: set[str] = set()
 
         if not cfg.cdc_envelope_enabled:
             self.client = None
@@ -77,6 +82,24 @@ class SchemaRuntime:
             raise RuntimeError("Schema Registry dependencies are unavailable")
 
         self.client = SchemaRegistryClient({"url": cfg.schema_registry_url})
+
+    def _sr_request_json(self, method: str, path: str, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Выполняет REST-запрос к SR URL из конфига и возвращает JSON-ответ."""
+        if self.client is None:
+            raise RuntimeError("SchemaRuntime SR request called while CDC_ENVELOPE_ENABLED=false")
+        # Шаг 1: готовим endpoint и (опционально) JSON body.
+        endpoint = self.cfg.schema_registry_url.rstrip("/") + path
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8") if payload is not None else None
+
+        # Шаг 2: формируем HTTP request.
+        req = urllib.request.Request(endpoint, data=body, method=method.upper())
+        if body is not None:
+            req.add_header("Content-Type", "application/vnd.schemaregistry.v1+json")
+
+        # Шаг 3: выполняем запрос и парсим JSON-ответ.
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            raw = resp.read().decode("utf-8")
+            return json.loads(raw) if raw else {}
 
     def _schema_file_path(self, topic: str, kind: str) -> Path:
         return Path(self.cfg.schema_dir) / f"{topic}.{kind}.json"
@@ -102,6 +125,48 @@ class SchemaRuntime:
             },
         )
 
+    def _preflight_subject_compatibility(self, subject: str, schema_text: str) -> None:
+        """Проверяет совместимость schema с latest версией subject в SR.
+
+        Поведение:
+        - если subject отсутствует и `SCHEMA_AUTO_REGISTER=true`, считаем preflight успешным;
+        - если subject отсутствует и `SCHEMA_AUTO_REGISTER=false`, это ошибка;
+        - если `is_compatible=false`, это ошибка.
+        """
+        # Шаг 1: URL-экранируем subject и формируем payload в формате SR compatibility API.
+        subject_q = urllib.parse.quote(subject, safe="")
+        payload = {
+            "schemaType": "JSON",
+            "schema": schema_text,
+        }
+        try:
+            # Шаг 2: проверяем совместимость с latest версией subject.
+            result = self._sr_request_json(
+                method="POST",
+                path=f"/compatibility/subjects/{subject_q}/versions/latest",
+                payload=payload,
+            )
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="ignore")
+            if exc.code == 404:
+                # 404 означает "subject не существует".
+                # Для auto-register допускаем этот случай как первый запуск новой схемы.
+                if self.cfg.schema_auto_register:
+                    return
+                # Если auto-register выключен, отсутствие subject — это блокирующая ошибка.
+                raise RuntimeError(
+                    f"Schema Registry subject not found for preflight: {subject} "
+                    f"(SCHEMA_AUTO_REGISTER=false, HTTP 404 {body})"
+                ) from exc
+            # Прочие HTTP-ошибки считаем проблемой preflight.
+            raise RuntimeError(
+                f"Schema Registry preflight failed for subject={subject}: HTTP {exc.code} {body}"
+            ) from exc
+
+        # Шаг 3: явная несовместимость останавливает запуск до чтения LogMiner batch.
+        if result.get("is_compatible") is False:
+            raise RuntimeError(f"Schema Registry compatibility check failed for subject={subject} (latest)")
+
     def key_serializer(self, topic: str) -> Any:
         if topic not in self._key_serializers:
             # Ленивая инициализация: schema читается/парсится один раз на topic.
@@ -113,6 +178,26 @@ class SchemaRuntime:
             # Аналогичный lazy-cache для value schema.
             self._value_serializers[topic] = self._json_serializer(self._load_schema_text(topic, "value"))
         return self._value_serializers[topic]
+
+    def preflight_topic(self, topic: str) -> None:
+        """Preflight topic для CDC SR режима:
+        1) проверяем наличие локальных schema-файлов;
+        2) проверяем совместимость `<topic>-key/value` с latest subject в SR.
+        """
+        if not self.cfg.cdc_envelope_enabled:
+            return
+        if topic in self._preflight_topics:
+            # Уже проверяли этот topic в текущем запуске, повторять не нужно.
+            return
+
+        # Шаг 1: убеждаемся, что локальные схемы реально существуют.
+        key_schema_text = self._load_schema_text(topic, "key")
+        value_schema_text = self._load_schema_text(topic, "value")
+        # Шаг 2: проверяем SR compatibility отдельно для key/value subject-ов.
+        self._preflight_subject_compatibility(f"{topic}-key", key_schema_text)
+        self._preflight_subject_compatibility(f"{topic}-value", value_schema_text)
+        # Шаг 3: кэшируем успешный preflight topic, чтобы не дергать SR повторно.
+        self._preflight_topics.add(topic)
 
     def serialize_key(self, topic: str, key_obj: RowDict) -> bytes:
         if not self.cfg.cdc_envelope_enabled:

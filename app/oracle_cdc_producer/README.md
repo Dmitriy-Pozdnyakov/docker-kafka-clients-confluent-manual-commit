@@ -115,6 +115,18 @@ SCHEMA_OVERWRITE=yes SCHEMA_REGISTER_SR= ./scripts/cron_cdc.sh pipeline
 
 Примечание по SR:
 - если у `oracle-schema-build` включен `REGISTER_SR=yes`, возможен `409 Conflict` при несовместимой эволюции схем в Schema Registry (это не связано с DSN).
+- в текущей версии schema-build регистрация сделана idempotent: при `409` и совпадающей latest схеме subject помечается как `already-registered` (не ошибка).
+
+## SR Preflight в producer
+
+При `CDC_ENVELOPE_ENABLED=true` producer перед отправкой CDC-событий делает preflight:
+- проверяет наличие локальных schema-файлов `<topic>.key.json` и `<topic>.value.json`;
+- проверяет совместимость subject-ов `<topic>-key` и `<topic>-value` через SR compatibility API.
+
+Сценарии запуска:
+- single-topic: preflight выполняется до начала batch;
+- topic-per-table + `CDC_SUPPORTED_TABLES`: preflight выполняется заранее для всех topic из whitelist;
+- topic-per-table без whitelist: preflight делается лениво на first-use topic.
 
 ## Parser backend режимы
 
