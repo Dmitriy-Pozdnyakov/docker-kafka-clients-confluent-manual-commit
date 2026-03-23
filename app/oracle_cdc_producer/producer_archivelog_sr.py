@@ -30,7 +30,7 @@ try:
         load_table_metadata,
         qualified_table_name,
     )
-    from .config import Config, load_config_from_env, merge_name_filters, validate_config
+    from .config import Config, load_config_from_env, validate_config
 except ImportError:  # pragma: no cover
     from cdc_schema_registry import (
         SchemaRuntime,
@@ -39,7 +39,7 @@ except ImportError:  # pragma: no cover
         load_table_metadata,
         qualified_table_name,
     )
-    from config import Config, load_config_from_env, merge_name_filters, validate_config
+    from config import Config, load_config_from_env, validate_config
 
 
 def _log(cfg: Config, message: str) -> None:
@@ -385,8 +385,8 @@ def run_once(cfg: Config) -> Dict[str, Any]:
     4) flush + проверка delivery,
     5) обновляем state только при успешной доставке.
     """
-    merged_schemas = merge_name_filters(cfg.filter_schema, cfg.filter_schemas)
-    merged_tables = merge_name_filters(cfg.filter_table, cfg.filter_tables)
+    merged_schemas = list(cfg.filter_schemas)
+    merged_tables = list(cfg.filter_tables)
 
     state = _load_state(cfg)
     last_commit_scn = int(state.get("last_commit_scn", cfg.start_from_commit_scn))
@@ -541,7 +541,7 @@ def run_once(cfg: Config) -> Dict[str, Any]:
                     process_record(record)
         else:
             # Legacy-режим: забираем все строки сразу.
-            _log(cfg, "fetch mode=fetchall (legacy)")
+            _log(cfg, "fetch mode=fetchall (compat)")
             for record in cur.fetchall():
                 process_record(record)
 

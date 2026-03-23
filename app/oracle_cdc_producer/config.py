@@ -4,14 +4,14 @@
 1) dataclass `Config`;
 2) загрузку конфига из env;
 3) валидацию обязательных параметров;
-4) helper для объединения фильтров.
+4) парсинг CSV-фильтров.
 """
 
 from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from typing import List, Sequence, Tuple
+from typing import List, Tuple
 
 try:
     from .cdc_schema_registry import schema_registry_dependencies_available
@@ -59,8 +59,6 @@ class Config:
     # =========================
     # Filters / batching
     # =========================
-    filter_schema: str = ""
-    filter_table: str = ""
     filter_schemas: Tuple[str, ...] = ()
     filter_tables: Tuple[str, ...] = ()
     max_rows_per_batch: int = 5000
@@ -74,8 +72,9 @@ class Config:
     cdc_supported_tables: Tuple[str, ...] = ()
     cdc_key_mode: str = "technical"
     cdc_parse_error_mode: str = "raw"
+    cdc_sql_parser_backend: str = "auto"
     schema_registry_url: str = "http://127.0.0.1:18081"
-    schema_dir: str = "./schemas"
+    schema_dir: str = "schemas"
     schema_auto_register: bool = True
     schema_use_latest_version: bool = False
     schema_normalize: bool = True
@@ -105,19 +104,6 @@ def parse_csv_upper(raw: str) -> List[str]:
         if normalized and normalized not in result:
             result.append(normalized)
     return result
-
-
-def merge_name_filters(single_value: str, many_values: Sequence[str]) -> List[str]:
-    """Объединяет FILTER_SCHEMA/FILTER_TABLE и FILTER_SCHEMAS/FILTER_TABLES в один список."""
-    merged: List[str] = []
-    single = str(single_value).strip().upper()
-    if single:
-        merged.append(single)
-    for value in many_values:
-        normalized = str(value).strip().upper()
-        if normalized and normalized not in merged:
-            merged.append(normalized)
-    return merged
 
 
 def load_config_from_env() -> Config:
@@ -150,8 +136,6 @@ def load_config_from_env() -> Config:
         topic_separator=os.getenv("TOPIC_SEPARATOR", ".").strip() or ".",
         state_file=os.getenv("STATE_FILE", "./oracle_kafka_state_archivelog_sr_cdc.json").strip(),
         start_from_commit_scn=int(os.getenv("START_FROM_SCN", "0") or "0"),
-        filter_schema=os.getenv("FILTER_SCHEMA", "").strip(),
-        filter_table=os.getenv("FILTER_TABLE", "").strip(),
         filter_schemas=tuple(parse_csv_upper(os.getenv("FILTER_SCHEMAS", ""))),
         filter_tables=tuple(parse_csv_upper(os.getenv("FILTER_TABLES", ""))),
         max_rows_per_batch=int(os.getenv("MAX_ROWS_PER_BATCH", "5000")),
@@ -161,8 +145,9 @@ def load_config_from_env() -> Config:
         cdc_supported_tables=tuple(parse_csv_upper(os.getenv("CDC_SUPPORTED_TABLES", ""))),
         cdc_key_mode=os.getenv("CDC_KEY_MODE", "technical").strip().lower(),
         cdc_parse_error_mode=os.getenv("CDC_PARSE_ERROR_MODE", "raw").strip().lower(),
+        cdc_sql_parser_backend=os.getenv("CDC_SQL_PARSER_BACKEND", "auto").strip().lower(),
         schema_registry_url=os.getenv("SCHEMA_REGISTRY_URL", "http://127.0.0.1:18081").strip(),
-        schema_dir=os.getenv("SCHEMA_DIR", "./schemas").strip(),
+        schema_dir=os.getenv("SCHEMA_DIR", "schemas").strip(),
         schema_auto_register=str_to_bool(os.getenv("SCHEMA_AUTO_REGISTER", "true"), True),
         schema_use_latest_version=str_to_bool(os.getenv("SCHEMA_USE_LATEST_VERSION", "false"), False),
         schema_normalize=str_to_bool(os.getenv("SCHEMA_NORMALIZE", "true"), True),
@@ -191,6 +176,11 @@ def validate_config(cfg: Config) -> None:
         raise RuntimeError("CDC_KEY_MODE must be one of: pk, technical")
     if cfg.cdc_parse_error_mode not in {"raw", "fail"}:
         raise RuntimeError("CDC_PARSE_ERROR_MODE must be one of: raw, fail")
+    if cfg.cdc_sql_parser_backend not in {"auto", "auto_legacy_first", "legacy_first", "legacy", "sqlglot"}:
+        raise RuntimeError(
+            "CDC_SQL_PARSER_BACKEND must be one of: "
+            "auto, auto_legacy_first, legacy_first, legacy, sqlglot"
+        )
 
     if cfg.cdc_envelope_enabled:
         if not schema_registry_dependencies_available():

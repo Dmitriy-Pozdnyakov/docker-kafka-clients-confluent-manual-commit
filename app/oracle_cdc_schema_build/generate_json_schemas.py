@@ -8,10 +8,10 @@
    - через список таблиц `SCHEMA.TABLE` + topic-prefix.
 
 Примеры:
-  python app/oracle_logminer_cdc/generate_json_schemas.py \
+  python app/oracle_cdc_schema_build/generate_json_schemas.py \
     --topics oracle.cdc.hr.employees,oracle.cdc.hr.departments
 
-  python app/oracle_logminer_cdc/generate_json_schemas.py \
+  python app/oracle_cdc_schema_build/generate_json_schemas.py \
     --tables HR.EMPLOYEES,HR.DEPARTMENTS \
     --topic-prefix oracle.cdc
 """
@@ -128,7 +128,7 @@ def main() -> int:
     parser.add_argument("--topic-separator", default=".", help="Topic separator (default: .)")
     parser.add_argument(
         "--schema-dir",
-        default="app/oracle_logminer_cdc/schemas",
+        default="schemas",
         help="Output directory for generated schema files",
     )
     parser.add_argument("--overwrite", action="store_true", help="Overwrite existing schema files")

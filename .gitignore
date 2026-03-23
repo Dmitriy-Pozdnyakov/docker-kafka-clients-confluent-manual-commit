@@ -1,5 +1,6 @@
 .env
 state/*.json
 .pycache_local/
-app/oracle_logminer_cdc/schemas/
+schemas/
 certs/
+.tmp-pydeps/

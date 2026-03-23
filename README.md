@@ -1,95 +1,50 @@
 # Docker Kafka Clients (Confluent Manual Commit)
 
-Вариант 2: producer/consumer на `confluent-kafka` с более продовым паттерном.
+Текущий проект разделен на 2 CDC-процесса:
 
-## Запуск
+1. `app/oracle_cdc_schema_build` — генерация и регистрация схем.
+2. `app/oracle_cdc_producer` — producer LogMiner -> Kafka (SR CDC envelope).
 
-```bash
-cp .env.example .env
-cp env/producer.env.example env/producer.env
-cp env/consumer.env.example env/consumer.env
-cp env/oracle-producer-archivelog.env.example env/oracle-producer-archivelog.env
-docker compose up -d --build
-docker compose logs -f producer consumer
-```
-
-Перед запуском проверь `BROKER`/`KAFKA_BROKER` в сервисных env-файлах из директории `env/`.
-
-## Особенности
-
-- producer: `enable.idempotence=true`, `acks=all`
-- consumer: `enable.auto.commit=false`
-- commit offset только после успешной обработки
-- при ошибке обработки commit не делается (сообщение перечитается)
-
-## Режимы работы (через env)
-
-- `PRODUCER_RUN_MODE=continuous|interval|oneshot`
-- `CONSUMER_RUN_MODE=continuous|interval|oneshot`
-
-Где менять:
-
-- producer: `env/producer.env`
-- consumer: `env/consumer.env`
-
-Рекомендация:
-
-- `consumer`: `continuous`
-- `producer` для БД-источника: `oneshot` + внешний scheduler (cron/Kubernetes CronJob/Airflow)
-
-Полезные параметры:
-
-- producer: `PRODUCER_INTERVAL_SEC`, `PRODUCER_BATCH_SIZE`
-- consumer: `CONSUMER_INTERVAL_SEC`, `CONSUMER_BATCH_SIZE`, `CONSUMER_BATCH_TIMEOUT_SEC`
-
-Примеры:
+## Подготовка env
 
 ```bash
-# continuous (дефолт)
-docker compose up -d --build
+cp app/oracle_cdc_producer/env/oracle-producer-archivelog-sr.env.example \
+   app/oracle_cdc_producer/env/oracle-producer-archivelog-sr.env
 
-# oneshot producer (один проход)
-docker compose run --rm -e PRODUCER_RUN_MODE=oneshot producer
-
-# interval consumer (каждые 30 сек)
-docker compose run --rm -e CONSUMER_RUN_MODE=interval -e CONSUMER_INTERVAL_SEC=30 consumer
+cp app/oracle_cdc_schema_build/env/oracle-schema-build.env.example \
+   app/oracle_cdc_schema_build/env/oracle-schema-build.env
 ```
 
-## Oracle -> Kafka producer (LogMiner)
-
-В эту же контейнерную папку добавлены скрипты:
-
-- `app/oracle_to_kafka_producer_archivelog.py` (вариант через `ADD_LOGFILE` из `v$archived_log`)
-
-Запускать его лучше вручную (он не стартует постоянно через `up -d`):
+## Процесс 1: создание схем
 
 ```bash
-docker compose run --rm oracle-producer-archivelog
+docker compose run --rm oracle-schema-build
 ```
 
-Подробная инструкция по archived-log версии:
+Скрипт:
+- `app/oracle_cdc_schema_build/build_schemas_from_oracle.py`
 
-- `README_ORACLE_ARCHIVELOG.md`
-- `app/oracle_logminer_cdc/README.md` (вариант с Schema Registry + CDC envelope)
+Схемы складываются в:
+- `schemas`
 
-Быстрый запуск SR-прототипа:
+## Процесс 2: запуск producer
 
 ```bash
-docker compose run --rm oracle-producer-archivelog \
-  python app/oracle_logminer_cdc/producer_archivelog_sr.py
+docker compose run --rm oracle-producer-archivelog-sr
 ```
 
-Логика:
+Скрипт:
+- `app/oracle_cdc_producer/producer_archivelog_sr.py`
 
-- читает Oracle LogMiner (`V$LOGMNR_CONTENTS`)
-- пишет события в `KAFKA_TOPIC` (по умолчанию `oracle.logminer.raw`)
-- хранит watermark в `./state/oracle_kafka_state_archivelog.json`
+Roadmap и журнал доработок:
+- `road-map.md`
+
+Producer читает схемы из общей директории:
+- `schemas`
 
 ## TLS сертификат
 
 Положи CA сертификат в `./certs/ca.crt` перед запуском.
-
-Пример:
 
 ```bash
 cp ../apache-kafka-stack/scripts/tls/ca.crt ./certs/ca.crt

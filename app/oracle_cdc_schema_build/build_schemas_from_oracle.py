@@ -334,7 +334,7 @@ def main() -> int:
     parser.add_argument("--tables-file", default="", help="File with SCHEMA.TABLE per line")
     parser.add_argument("--topic-prefix", default="oracle.cdc")
     parser.add_argument("--topic-separator", default=".")
-    parser.add_argument("--schema-dir", default="app/oracle_logminer_cdc/schemas")
+    parser.add_argument("--schema-dir", default="schemas")
     parser.add_argument("--key-mode", default="technical", choices=["technical", "pk"])
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--register-sr", action="store_true")
