@@ -5,3 +5,5 @@ state/cron-logs/
 schemas/
 certs/
 .tmp-pydeps/
+comands
+issues-checklist-local.md

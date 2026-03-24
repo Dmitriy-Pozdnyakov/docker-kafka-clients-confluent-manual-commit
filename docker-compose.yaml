@@ -12,6 +12,18 @@ services:
       - ./schemas:/app/schemas
     restart: "no"
 
+  oracle-producer-archivelog-raw:
+    build: .
+    mem_limit: ${ORACLE_PRODUCER_RAW_MEM_LIMIT:-512m}
+    cpus: ${ORACLE_PRODUCER_RAW_CPUS:-0.50}
+    env_file:
+      - ./app/oracle_raw_producer/env/oracle-producer-archivelog-raw.env
+    command: ["python", "app/oracle_raw_producer/producer_archivelog_raw.py"]
+    volumes:
+      - ./certs/ca.crt:/certs/ca.crt:ro
+      - ./state:/state
+    restart: "no"
+
   oracle-schema-build:
     build: .
     mem_limit: ${ORACLE_SCHEMA_BUILD_MEM_LIMIT:-512m}

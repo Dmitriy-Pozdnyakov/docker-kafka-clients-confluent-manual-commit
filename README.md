@@ -1,15 +1,19 @@
 # Docker Kafka Clients (Confluent Manual Commit)
 
-Текущий проект разделен на 2 CDC-процесса:
+Текущий проект разделен на 3 процесса:
 
 1. `app/oracle_cdc_schema_build` — генерация и регистрация схем.
-2. `app/oracle_cdc_producer` — producer LogMiner -> Kafka (SR CDC envelope).
+2. `app/oracle_cdc_producer` — strict CDC producer LogMiner -> Kafka (SR CDC envelope).
+3. `app/oracle_raw_producer` — отдельный raw producer LogMiner -> Kafka (без SR/CDC envelope).
 
 ## Подготовка env
 
 ```bash
 cp app/oracle_cdc_producer/env/oracle-producer-archivelog-sr.env.example \
    app/oracle_cdc_producer/env/oracle-producer-archivelog-sr.env
+
+cp app/oracle_raw_producer/env/oracle-producer-archivelog-raw.env.example \
+   app/oracle_raw_producer/env/oracle-producer-archivelog-raw.env
 
 cp app/oracle_cdc_schema_build/env/oracle-schema-build.env.example \
    app/oracle_cdc_schema_build/env/oracle-schema-build.env
@@ -19,7 +23,7 @@ cp app/oracle_cdc_schema_build/env/oracle-schema-build.env.example \
 
 В проекте используются 2 независимых набора Oracle-кредов:
 
-1. `oracle-producer-archivelog-sr` (LogMiner runtime):
+1. `oracle-producer-archivelog-sr` / `oracle-producer-archivelog-raw` (LogMiner runtime):
 - пользователь/пароль для чтения redo stream (`C##LOGMINER`);
 - DSN: `.../FREE` (CDB service).
 
@@ -39,7 +43,7 @@ docker compose run --rm oracle-schema-build
 Схемы складываются в:
 - `schemas`
 
-## Процесс 2: запуск producer
+## Процесс 2: запуск CDC producer
 
 ```bash
 docker compose run --rm oracle-producer-archivelog-sr
@@ -53,6 +57,18 @@ Roadmap и журнал доработок:
 
 Producer читает схемы из общей директории:
 - `schemas`
+
+## Процесс 3: запуск raw producer
+
+```bash
+docker compose run --rm oracle-producer-archivelog-raw
+```
+
+Скрипт:
+- `app/oracle_raw_producer/producer_archivelog_raw.py`
+
+Документация raw-модуля:
+- `app/oracle_raw_producer/README.md`
 
 ## TLS сертификат
 

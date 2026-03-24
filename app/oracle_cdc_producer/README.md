@@ -5,6 +5,10 @@
 - формирование CDC envelope;
 - публикация в Kafka (Schema Registry JSON).
 
+Важно:
+- этот producer работает в strict CDC-only режиме (`CDC_ENVELOPE_ENABLED=true`);
+- raw режим вынесен в отдельный модуль `app/oracle_raw_producer`.
+
 ## Точка входа и запуск
 
 Запускается сервисом `oracle-producer-archivelog-sr` из `docker-compose.yaml`:
@@ -30,7 +34,7 @@ docker compose run --rm oracle-producer-archivelog-sr
 
 Важно:
 - без `sqlglot` producer работает, но parser backend будет legacy-only;
-- SR-зависимости нужны, когда `CDC_ENVELOPE_ENABLED=true`.
+- SR-зависимости обязательны, т.к. этот runner работает только в CDC + SR режиме.
 
 ## Что откуда вызывается (Python-модули)
 
@@ -74,7 +78,7 @@ docker compose run --rm oracle-producer-archivelog-sr
 
 Примеры режимов:
 
-`<project-dir>` в примерах ниже — путь к каталогу `docker-kafka-clients-confluent-manual-commit`.
+`<project-dir>` в примерах ниже — путь к каталогу `docker-kafka-confluent-manual-commit`.
 
 Тестовый режим (интеграционный прогон, вручную):
 

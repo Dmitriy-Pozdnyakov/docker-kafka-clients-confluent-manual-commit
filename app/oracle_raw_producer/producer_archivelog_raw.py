@@ -1,16 +1,13 @@
 #!/usr/bin/env python3
-"""Oracle LogMiner -> Kafka CDC + Schema Registry runner (one-shot).
+"""Oracle LogMiner -> Kafka RAW runner (one-shot).
 
-Важно:
-- Это отдельный сценарий, стабильный скрипт не затрагивается.
-- Kafka auth/SSL поддержаны (PLAINTEXT/SSL/SASL_* как в стабильном скрипте).
-- Для Schema Registry здесь оставлен только URL (без отдельного SR auth/SSL слоя).
-
-Как читать этот файл:
-1) В этом файле оставлен runtime-скелет (конфиг, подключение, batch-run, state).
-2) Сложная CDC/SR логика вынесена в модуль `cdc_schema_registry.py`.
-3) Файл рассчитан на one-shot запуск (удобно для cron/flock на VM).
+Этот скрипт вынесен из CDC producer, чтобы raw-режим жил отдельно:
+- публикует в Kafka сырой JSON-слепок строк из v$logmnr_contents;
+- не использует CDC envelope и Schema Registry;
+- рассчитан на one-shot запуск (cron/flock).
 """
+
+from __future__ import annotations
 
 import json
 import os
@@ -25,61 +22,43 @@ import oracledb
 from confluent_kafka import Producer
 
 try:
-    from .cdc_schema_registry import (
-        SchemaRuntime,
-        build_cdc_event,
-        is_cdc_table_enabled,
-        load_table_metadata,
-    )
     from .config import Config, load_config_from_env, validate_config
 except ImportError:  # pragma: no cover
-    from cdc_schema_registry import (
-        SchemaRuntime,
-        build_cdc_event,
-        is_cdc_table_enabled,
-        load_table_metadata,
-    )
     from config import Config, load_config_from_env, validate_config
 
 
 def _log(cfg: Config, message: str) -> None:
     if cfg.verbose:
-        print(f"[oracle->kafka:archivelog-sr-cdc] {message}")
+        print(f"[oracle->kafka:archivelog-raw] {message}")
 
 
 def _load_state(cfg: Config) -> Dict[str, Any]:
-    """Читает watermark state; при первом запуске возвращает стартовый SCN из конфига."""
+    """Read watermark state. Return START_FROM_SCN on first run."""
     path = Path(cfg.state_file)
-    # Шаг 1: если state-файла еще нет, стартуем от START_FROM_SCN.
     if not path.exists():
         return {"last_commit_scn": cfg.start_from_commit_scn}
 
     try:
-        # Шаг 2: читаем JSON state целиком.
         payload = json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
         raise RuntimeError(f"STATE_FILE is not valid JSON: {path} ({exc})") from exc
 
-    # Шаг 3: проверяем форму state-файла.
     if not isinstance(payload, dict):
         raise RuntimeError(f"STATE_FILE must contain JSON object, got: {type(payload).__name__}")
     if "last_commit_scn" not in payload:
         raise RuntimeError(f"STATE_FILE is missing 'last_commit_scn': {path}")
 
     try:
-        # Шаг 4: нормализуем тип watermark к int, чтобы дальше не ловить сюрпризы.
         payload["last_commit_scn"] = int(payload.get("last_commit_scn"))
     except Exception as exc:
         raise RuntimeError(f"STATE_FILE has invalid 'last_commit_scn': {payload.get('last_commit_scn')!r}") from exc
 
-    # Шаг 5: возвращаем валидированный state.
     return payload
 
 
 def _fsync_directory(path: Path) -> None:
-    """Пытается fsync каталога после os.replace для лучшей crash-consistency."""
+    """Try to fsync dir after os.replace for better crash-consistency."""
     try:
-        # Нужен fsync директории, чтобы операция rename была надежно зафиксирована на диске.
         dir_fd = os.open(str(path), os.O_RDONLY)
     except Exception:
         return
@@ -92,28 +71,20 @@ def _fsync_directory(path: Path) -> None:
 
 
 def _atomic_write_json(path: Path, payload: Dict[str, Any]) -> None:
-    """Атомарно пишет JSON: tmp -> flush -> fsync -> os.replace."""
-    # Шаг 1: гарантируем существование целевого каталога.
+    """Atomically write JSON: tmp -> flush -> fsync -> os.replace."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    # Шаг 2: создаем временный файл в том же каталоге
-    # (это важно для атомарного os.replace на одном файловом разделе).
     fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
     tmp_path = Path(tmp_name)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
-            # Шаг 3: пишем JSON payload во временный файл.
             json.dump(payload, f, ensure_ascii=False)
             f.write("\n")
-            # Шаг 4: принудительно сбрасываем буферы Python и ОС.
             f.flush()
             os.fsync(f.fileno())
-        # Шаг 5: атомарно заменяем старый state новым.
         os.replace(str(tmp_path), str(path))
-        # Шаг 6: дополнительно fsync каталога после rename.
         _fsync_directory(path.parent)
     except Exception:
         try:
-            # При любой ошибке удаляем temp-файл, чтобы не оставлять мусор.
             if tmp_path.exists():
                 tmp_path.unlink()
         except Exception:
@@ -122,9 +93,8 @@ def _atomic_write_json(path: Path, payload: Dict[str, Any]) -> None:
 
 
 def _save_state(cfg: Config, last_commit_scn: int) -> None:
-    """Сохраняет watermark после успешного batch атомарной записью."""
+    """Persist watermark after successful batch."""
     path = Path(cfg.state_file)
-    # Собираем компактный state и передаем его в единый атомарный writer.
     _atomic_write_json(
         path,
         {
@@ -135,7 +105,7 @@ def _save_state(cfg: Config, last_commit_scn: int) -> None:
 
 
 def _build_kafka_producer(cfg: Config) -> Producer:
-    """Создает Kafka Producer под текущий security mode (PLAINTEXT/SSL/SASL_*)."""
+    """Create Kafka Producer for PLAINTEXT/SSL/SASL_* modes."""
     proto = cfg.kafka_security_protocol.upper()
     conf: Dict[str, Any] = {
         "bootstrap.servers": cfg.kafka_broker,
@@ -157,30 +127,25 @@ def _build_kafka_producer(cfg: Config) -> Producer:
 
 
 def _end_logminer(cur: oracledb.Cursor) -> None:
-    """Безопасно завершает сессию LogMiner (ошибки глотаем на стороне PL/SQL блока)."""
-    cur.execute("""
+    """Safely end LogMiner session."""
+    cur.execute(
+        """
         BEGIN
           DBMS_LOGMNR.END_LOGMNR;
         EXCEPTION
           WHEN OTHERS THEN NULL;
         END;
-    """)
+        """
+    )
 
 
 def _get_archived_logs(cur: oracledb.Cursor, from_commit_scn: int, limit_rows: int) -> List[Dict[str, Any]]:
-    """Подбирает archived logs под текущий watermark.
+    """Locate archived logs for current watermark."""
 
-    Логика:
-    - сначала ищем anchor-лог, перекрывающий from_commit_scn;
-    - затем берем "хвост" по sequence, ограниченный ARCHIVE_LOG_LIMIT;
-    - fallback для bootstrap (from_commit_scn <= 0): последние N логов.
-    """
     def to_int_or_none(v: Any) -> Optional[int]:
         return None if v is None else int(v)
 
     def fetch_dict_rows(sql_text: str, binds: Dict[str, Any]) -> List[Dict[str, Any]]:
-        # Локальный helper: делает словари по именам колонок,
-        # чтобы код ниже не был "индексным" и был проще читать/поддерживать.
         prev = cur.rowfactory
         try:
             cur.execute(sql_text, binds)
@@ -249,7 +214,7 @@ def _get_archived_logs(cur: oracledb.Cursor, from_commit_scn: int, limit_rows: i
 
 
 def _add_logfile(cur: oracledb.Cursor, logfile: str, first: bool) -> None:
-    """Добавляет redo-файл в LogMiner (NEW для первого, ADDFILE для остальных)."""
+    """Add redo log file to LogMiner."""
     option = "DBMS_LOGMNR.NEW" if first else "DBMS_LOGMNR.ADDFILE"
     cur.execute(
         f"""
@@ -262,7 +227,7 @@ def _add_logfile(cur: oracledb.Cursor, logfile: str, first: bool) -> None:
 
 
 def _start_logminer(cur: oracledb.Cursor, cfg: Config, log_files: List[str]) -> None:
-    """Стартует LogMiner на выбранном наборе archived logs."""
+    """Start LogMiner on selected archived logs."""
     if not log_files:
         raise RuntimeError("No archived logs found in v$archived_log")
     _end_logminer(cur)
@@ -274,11 +239,13 @@ def _start_logminer(cur: oracledb.Cursor, cfg: Config, log_files: List[str]) -> 
         options += " + DBMS_LOGMNR.NO_ROWID_IN_STMT"
 
     cur.call_timeout = cfg.call_timeout_ms
-    cur.execute(f"""
-      BEGIN
-        DBMS_LOGMNR.START_LOGMNR(OPTIONS => {options});
-      END;
-    """)
+    cur.execute(
+        f"""
+        BEGIN
+          DBMS_LOGMNR.START_LOGMNR(OPTIONS => {options});
+        END;
+        """
+    )
 
 
 def _build_fetch_rows_query(
@@ -287,13 +254,7 @@ def _build_fetch_rows_query(
     filter_tables: Sequence[str],
     max_rows_per_batch: int,
 ) -> Tuple[str, Dict[str, Any]]:
-    """Строит SQL для чтения DML из v$logmnr_contents.
-
-    Важные моменты:
-    - работаем только с commit_scn IS NOT NULL;
-    - max_rows_per_batch ограничивает с добором целого commit_scn (без разрыва commit внутри батча);
-    - фильтры схем/таблиц добавляются только если заданы в конфиге.
-    """
+    """Build SQL for reading DML rows from v$logmnr_contents."""
     base_sql = """
     SELECT
       commit_scn, scn, timestamp, seg_owner, table_name,
@@ -307,20 +268,20 @@ def _build_fetch_rows_query(
     binds: Dict[str, Any] = {"from_commit_scn": from_commit_scn}
 
     if filter_schemas:
-        ph: List[str] = []
+        placeholders: List[str] = []
         for i, value in enumerate(filter_schemas):
             key = f"filter_schema_{i}"
-            ph.append(f":{key}")
+            placeholders.append(f":{key}")
             binds[key] = value
-        base_sql += f" AND seg_owner IN ({', '.join(ph)})"
+        base_sql += f" AND seg_owner IN ({', '.join(placeholders)})"
 
     if filter_tables:
-        ph = []
+        placeholders = []
         for i, value in enumerate(filter_tables):
             key = f"filter_table_{i}"
-            ph.append(f":{key}")
+            placeholders.append(f":{key}")
             binds[key] = value
-        base_sql += f" AND table_name IN ({', '.join(ph)})"
+        base_sql += f" AND table_name IN ({', '.join(placeholders)})"
 
     order_by = " ORDER BY commit_scn, redo_sequence, rs_id, ssn"
     if max_rows_per_batch > 0:
@@ -348,11 +309,12 @@ def _build_fetch_rows_query(
         binds["max_rows_per_batch"] = int(max_rows_per_batch)
     else:
         sql = f"{base_sql}{order_by}"
+
     return sql, binds
 
 
 def _record_to_row(columns: Sequence[str], record: Sequence[Any]) -> Dict[str, Any]:
-    """Преобразует tuple-record из Oracle в dict и нормализует timestamp."""
+    """Convert Oracle tuple-record to dict and normalize timestamp."""
     row = dict(zip(columns, record))
     ts = row.get("timestamp")
     if isinstance(ts, datetime):
@@ -360,8 +322,18 @@ def _record_to_row(columns: Sequence[str], record: Sequence[Any]) -> Dict[str, A
     return row
 
 
+def _event_key(row: Dict[str, Any]) -> bytes:
+    """Build deterministic technical key for raw event."""
+    key = (
+        f"{row.get('seg_owner','')}.{row.get('table_name','')}|"
+        f"{row.get('commit_scn','')}|{row.get('redo_sequence','')}|"
+        f"{row.get('rs_id','')}|{row.get('ssn','')}"
+    )
+    return key.encode("utf-8")
+
+
 def _sanitize_topic_part(value: str) -> str:
-    """Санитизирует часть topic (оставляет alnum, '-', '_' и '.')."""
+    """Sanitize topic segment (allow alnum, '-', '_' and '.')."""
     chars: List[str] = []
     for ch in str(value).strip().lower():
         chars.append(ch if (ch.isalnum() or ch in {"-", "_", "."}) else "_")
@@ -370,7 +342,7 @@ def _sanitize_topic_part(value: str) -> str:
 
 
 def _resolve_topic(cfg: Config, row: Dict[str, Any]) -> str:
-    """Определяет topic назначения: single-topic или topic-per-table."""
+    """Resolve target topic in single-topic or topic-per-table mode."""
     if not cfg.topic_per_table:
         return cfg.kafka_topic
     schema_part = _sanitize_topic_part(str(row.get("seg_owner", "")))
@@ -383,43 +355,6 @@ def _resolve_topic(cfg: Config, row: Dict[str, Any]) -> str:
     return cfg.topic_separator.join(parts)
 
 
-def _topic_from_qualified_table(cfg: Config, qualified_table: str) -> str:
-    """Строит target topic из строки `SCHEMA.TABLE` по текущим правилам роутинга."""
-    parts = str(qualified_table or "").split(".", 1)
-    if len(parts) != 2 or not parts[0] or not parts[1]:
-        raise RuntimeError(f"CDC_SUPPORTED_TABLES item must be in SCHEMA.TABLE format: {qualified_table!r}")
-    return _resolve_topic(
-        cfg,
-        {
-            "seg_owner": parts[0],
-            "table_name": parts[1],
-        },
-    )
-
-
-def _collect_initial_cdc_preflight_topics(cfg: Config) -> List[str]:
-    """Определяет список topic-ов для preflight до запуска batch.
-
-    Сценарии:
-    - single-topic: всегда один `cfg.kafka_topic`;
-    - topic-per-table + заполнен CDC_SUPPORTED_TABLES: preflight всех topic-ов из whitelist;
-    - topic-per-table + пустой whitelist: full preflight заранее невозможен (делаем lazy на first-use).
-    """
-    if not cfg.cdc_envelope_enabled:
-        return []
-    if not cfg.topic_per_table:
-        return [cfg.kafka_topic]
-    if not cfg.cdc_supported_tables:
-        return []
-
-    topics: List[str] = []
-    for qualified_table in cfg.cdc_supported_tables:
-        topic = _topic_from_qualified_table(cfg, qualified_table)
-        if topic not in topics:
-            topics.append(topic)
-    return topics
-
-
 def _produce_with_backpressure(
     cfg: Config,
     producer: Producer,
@@ -428,7 +363,7 @@ def _produce_with_backpressure(
     value: bytes,
     callback,
 ) -> Tuple[int, float]:
-    """Публикует сообщение в Kafka с ретраями при BufferError (локальная очередь producer заполнена)."""
+    """Produce with retries when local queue is full (BufferError)."""
     retries = 0
     waited = 0.0
     started = time.monotonic()
@@ -450,31 +385,21 @@ def _produce_with_backpressure(
             waited = now - started
 
 
-def _produce_cdc_event(
-    cfg: Config,
-    producer: Producer,
-    topic: str,
-    row: Dict[str, Any],
-    table_meta: Dict[str, Any],
-    schema_runtime: SchemaRuntime,
-    callback,
-) -> Tuple[int, float]:
-    """Путь CDC-публикации: строим envelope + сериализуем через Schema Registry."""
-    key_obj, value_obj = build_cdc_event(row, table_meta, cfg)
-    key_bytes = schema_runtime.serialize_key(topic, key_obj)
-    value_bytes = schema_runtime.serialize_value(topic, value_obj)
-    return _produce_with_backpressure(cfg, producer, topic, key_bytes, value_bytes, callback)
+def _produce_raw_event(cfg: Config, producer: Producer, topic: str, row: Dict[str, Any], callback) -> Tuple[int, float]:
+    """Publish raw JSON snapshot of LogMiner row."""
+    value = json.dumps(row, ensure_ascii=False).encode("utf-8")
+    return _produce_with_backpressure(cfg, producer, topic, _event_key(row), value, callback)
 
 
 def run_once(cfg: Config) -> Dict[str, Any]:
-    """Один one-shot batch.
+    """Run one raw batch.
 
-    Шаги:
-    1) читаем state (последний commit_scn),
-    2) подбираем archived logs и запускаем LogMiner,
-    3) читаем DML и публикуем CDC в Kafka (Schema Registry),
-    4) flush + проверка delivery,
-    5) обновляем state только при успешной доставке.
+    Steps:
+    1) read state watermark,
+    2) start LogMiner on archived logs,
+    3) read DML rows and publish raw events,
+    4) flush and verify delivery,
+    5) persist updated state.
     """
     merged_schemas = list(cfg.filter_schemas)
     merged_tables = list(cfg.filter_tables)
@@ -491,35 +416,19 @@ def run_once(cfg: Config) -> Dict[str, Any]:
             f"filter_schemas={','.join(merged_schemas) if merged_schemas else '*'}, "
             f"filter_tables={','.join(merged_tables) if merged_tables else '*'}, "
             f"max_rows_per_batch={cfg.max_rows_per_batch}, "
-            f"use_fetchmany={cfg.use_fetchmany}, fetchmany_size={cfg.fetchmany_size}, "
-            f"cdc_envelope_enabled={cfg.cdc_envelope_enabled})"
+            f"use_fetchmany={cfg.use_fetchmany}, fetchmany_size={cfg.fetchmany_size})"
         ),
     )
 
     producer = _build_kafka_producer(cfg)
-    schema_runtime = SchemaRuntime(cfg)
-
-    initial_preflight_topics = _collect_initial_cdc_preflight_topics(cfg)
-    if cfg.cdc_envelope_enabled:
-        if initial_preflight_topics:
-            for topic in initial_preflight_topics:
-                schema_runtime.preflight_topic(topic)
-            _log(cfg, f"sr preflight topics: {','.join(initial_preflight_topics)}")
-        elif cfg.topic_per_table:
-            _log(
-                cfg,
-                "sr preflight is deferred to first-use topics "
-                "(topic_per_table=true and CDC_SUPPORTED_TABLES is empty)",
-            )
 
     delivered = 0
     failed = 0
     queue_full_retries = 0
     queue_full_wait_sec = 0.0
     rows_count = 0
+    raw_rows = 0
     topics_used: Dict[str, int] = {}
-    cdc_rows = 0
-    skipped_non_cdc_rows = 0
 
     def on_delivery(err, _msg):
         nonlocal delivered, failed
@@ -564,67 +473,31 @@ def run_once(cfg: Config) -> Dict[str, Any]:
         last_batch_commit_scn: Optional[int] = None
 
         def process_record(record: Sequence[Any]) -> None:
-            # Обработка одной строки LogMiner:
-            # - нормализация строки,
-            # - выбор topic,
-            # - проверка whitelist CDC таблиц,
-            # - backpressure-safe CDC produce.
-            #
-            # Зачем здесь nonlocal:
-            # process_record() вложена в run_once(), а счетчики/агрегаты
-            # объявлены уровнем выше (в run_once()).
-            # nonlocal позволяет обновлять именно эти внешние переменные,
-            # а не создавать новые локальные внутри process_record().
             nonlocal rows_count, queue_full_retries, queue_full_wait_sec
-            nonlocal first_batch_commit_scn, last_batch_commit_scn
-            nonlocal cdc_rows, skipped_non_cdc_rows
+            nonlocal first_batch_commit_scn, last_batch_commit_scn, raw_rows
 
             row = _record_to_row(columns, record)
             rows_count += 1
 
-            # Фиксируем границы commit_scn внутри текущего батча.
             commit_scn = int(row["commit_scn"])
             if first_batch_commit_scn is None:
                 first_batch_commit_scn = commit_scn
             last_batch_commit_scn = commit_scn
 
-            # Для topic-per-table формируется отдельный topic на таблицу,
-            # иначе используем общий cfg.kafka_topic.
             topic = _resolve_topic(cfg, row)
-
-            # В strict CDC-only режиме таблицы вне CDC_SUPPORTED_TABLES пропускаем.
-            if not is_cdc_table_enabled(cfg, row):
-                skipped_non_cdc_rows += 1
-                if skipped_non_cdc_rows <= cfg.log_first_n_events:
-                    _log(
-                        cfg,
-                        (
-                            "skip non-cdc table "
-                            f"topic={topic} commit_scn={row.get('commit_scn')} "
-                            f"schema={row.get('seg_owner')} table={row.get('table_name')} "
-                            f"operation={row.get('operation')}"
-                        ),
-                    )
-                return
-
-            # Проверяем schema subject-ы до первой отправки в конкретный topic.
-            # Это fail-fast preflight для динамических topic-ов.
-            schema_runtime.preflight_topic(topic)
-            table_meta = load_table_metadata(conn, str(row.get("seg_owner", "")), str(row.get("table_name", "")))
-            retries, waited = _produce_cdc_event(cfg, producer, topic, row, table_meta, schema_runtime, on_delivery)
-            cdc_rows += 1
+            retries, waited = _produce_raw_event(cfg, producer, topic, row, on_delivery)
+            raw_rows += 1
 
             queue_full_retries += retries
             queue_full_wait_sec += waited
             topics_used[topic] = topics_used.get(topic, 0) + 1
-            # poll(0) запускает обработку delivery callbacks без блокировки.
             producer.poll(0)
 
-            if cdc_rows <= cfg.log_first_n_events:
+            if rows_count <= cfg.log_first_n_events:
                 _log(
                     cfg,
                     (
-                        "queued cdc event "
+                        "queued raw event "
                         f"topic={topic} commit_scn={row.get('commit_scn')} "
                         f"schema={row.get('seg_owner')} table={row.get('table_name')} "
                         f"operation={row.get('operation')}"
@@ -632,8 +505,6 @@ def run_once(cfg: Config) -> Dict[str, Any]:
                 )
 
         if cfg.use_fetchmany:
-            # Рекомендуемый режим:
-            # читаем Oracle чанками (меньше пиковая память, стабильнее на больших батчах).
             _log(cfg, f"fetch mode=fetchmany, fetchmany_size={cfg.fetchmany_size}")
             while True:
                 records = cur.fetchmany(cfg.fetchmany_size)
@@ -642,28 +513,25 @@ def run_once(cfg: Config) -> Dict[str, Any]:
                 for record in records:
                     process_record(record)
         else:
-            # Legacy-режим: забираем все строки сразу.
             _log(cfg, "fetch mode=fetchall (compat)")
             for record in cur.fetchall():
                 process_record(record)
 
         _log(cfg, f"rows fetched from v$logmnr_contents: {rows_count}")
 
-        # ВАЖНО: flush возвращает количество сообщений, оставшихся в локальной очереди.
-        # Для one-shot сценария это критичный сигнал: если > 0, подтверждать SCN нельзя.
         remaining_after_flush = producer.flush(cfg.kafka_flush_timeout_sec)
         _log(
             cfg,
             (
                 "kafka flush done "
-                f"(delivered={delivered}, failed={failed}, queued={cdc_rows}, "
+                f"(delivered={delivered}, failed={failed}, queued={raw_rows}, "
                 f"remaining_after_flush={remaining_after_flush}, "
                 f"queue_full_retries={queue_full_retries}, "
                 f"queue_full_wait_sec={queue_full_wait_sec:.3f})"
             ),
         )
         if failed > 0:
-            raise RuntimeError(f"Kafka delivery failures: {failed} of {cdc_rows}")
+            raise RuntimeError(f"Kafka delivery failures: {failed} of {raw_rows}")
         if remaining_after_flush > 0:
             raise RuntimeError(
                 "Kafka flush timeout: "
@@ -671,8 +539,6 @@ def run_once(cfg: Config) -> Dict[str, Any]:
                 f"after {cfg.kafka_flush_timeout_sec}s"
             )
 
-        # Обновляем state только после успешного flush и при отсутствии failed.
-        # Это защищает от потери данных при перезапуске one-shot джобы.
         if rows_count > 0:
             last_commit_scn = max(last_commit_scn, int(last_batch_commit_scn))
             _save_state(cfg, last_commit_scn)
@@ -682,6 +548,7 @@ def run_once(cfg: Config) -> Dict[str, Any]:
 
         result = {
             "rows": rows_count,
+            "raw_rows": raw_rows,
             "delivered": delivered,
             "failed": failed,
             "remaining_after_flush": remaining_after_flush,
@@ -689,8 +556,6 @@ def run_once(cfg: Config) -> Dict[str, Any]:
             "queue_full_wait_sec": round(queue_full_wait_sec, 3),
             "last_commit_scn": last_commit_scn,
             "topics_used": topics_used,
-            "cdc_rows": cdc_rows,
-            "skipped_non_cdc_rows": skipped_non_cdc_rows,
             "first_batch_commit_scn": first_batch_commit_scn,
             "last_batch_commit_scn": last_batch_commit_scn,
         }
@@ -713,14 +578,14 @@ def run_once(cfg: Config) -> Dict[str, Any]:
 
 
 def main() -> int:
-    """CLI-entrypoint: один запуск -> код 0/1 для cron/monitoring."""
+    """CLI entrypoint: one run -> exit code 0/1 for cron/monitoring."""
     cfg = load_config_from_env()
     validate_config(cfg)
 
     _log(
         cfg,
         (
-            "start one-shot sr-cdc batch "
+            "start one-shot raw batch "
             f"(dsn={cfg.oracle_dsn}, topic={cfg.kafka_topic}, "
             f"archive_log_limit={cfg.archive_log_limit}, state_file={cfg.state_file})"
         ),
@@ -730,7 +595,7 @@ def main() -> int:
         _log(cfg, f"one-shot finished: {stats}")
         return 0
     except Exception as exc:
-        print(f"[oracle->kafka:archivelog-sr-cdc] ERROR: {exc}", file=sys.stderr)
+        print(f"[oracle->kafka:archivelog-raw] ERROR: {exc}", file=sys.stderr)
         return 1
 
 

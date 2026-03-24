@@ -1,22 +1,10 @@
-"""Config layer for Oracle LogMiner CDC + Schema Registry runner.
-
-Содержит:
-1) dataclass `Config`;
-2) загрузку конфига из env;
-3) валидацию обязательных параметров;
-4) парсинг CSV-фильтров.
-"""
+"""Config layer for Oracle LogMiner RAW producer runner."""
 
 from __future__ import annotations
 
 import os
 from dataclasses import dataclass
 from typing import List, Tuple
-
-try:
-    from .cdc_schema_registry import schema_registry_dependencies_available
-except ImportError:  # pragma: no cover
-    from cdc_schema_registry import schema_registry_dependencies_available
 
 
 @dataclass
@@ -42,7 +30,7 @@ class Config:
     kafka_sasl_mechanism: str = "PLAIN"
     kafka_sasl_username: str = ""
     kafka_sasl_password: str = ""
-    kafka_client_id: str = "oracle-logminer-archivelog-sr-cdc"
+    kafka_client_id: str = "oracle-logminer-archivelog-raw"
     kafka_flush_timeout_sec: int = 30
     produce_retry_timeout_sec: int = 60
     produce_retry_poll_sec: float = 0.2
@@ -53,7 +41,7 @@ class Config:
     # =========================
     # State management
     # =========================
-    state_file: str = "./oracle_kafka_state_archivelog_sr_cdc.json"
+    state_file: str = "./oracle_kafka_state_archivelog_raw.json"
     start_from_commit_scn: int = 0
 
     # =========================
@@ -66,19 +54,6 @@ class Config:
     fetchmany_size: int = 1000
 
     # =========================
-    # Prototype CDC + Schema Registry
-    # =========================
-    cdc_envelope_enabled: bool = False
-    cdc_supported_tables: Tuple[str, ...] = ()
-    cdc_key_mode: str = "technical"
-    cdc_sql_parser_backend: str = "auto"
-    schema_registry_url: str = "http://127.0.0.1:18081"
-    schema_dir: str = "schemas"
-    schema_auto_register: bool = True
-    schema_use_latest_version: bool = False
-    schema_normalize: bool = True
-
-    # =========================
     # Logging
     # =========================
     verbose: bool = True
@@ -86,7 +61,7 @@ class Config:
 
 
 def str_to_bool(value: str, default: bool) -> bool:
-    """Нормализует bool-параметры из env (true/false, yes/no, 1/0)."""
+    """Normalize bool parameters from env (true/false, yes/no, 1/0)."""
     raw = value.strip().lower()
     if raw in {"1", "true", "yes", "on"}:
         return True
@@ -96,7 +71,7 @@ def str_to_bool(value: str, default: bool) -> bool:
 
 
 def parse_csv_upper(raw: str) -> List[str]:
-    """Преобразует CSV-строку в уникальный список UPPER-значений."""
+    """Convert CSV string to unique UPPER-case values preserving order."""
     result: List[str] = []
     for item in raw.split(","):
         normalized = item.strip().upper()
@@ -106,11 +81,9 @@ def parse_csv_upper(raw: str) -> List[str]:
 
 
 def load_config_from_env() -> Config:
-    """Собирает runtime-конфиг из env с безопасными дефолтами."""
+    """Build runtime config from env with safe defaults."""
     broker = os.getenv("KAFKA_BROKER", "").strip()
     if not broker:
-        # BROKER оставлен как legacy alias для обратной совместимости
-        # со старыми env-файлами/скриптами.
         broker = os.getenv("BROKER", "127.0.0.1:19092,127.0.0.1:19093,127.0.0.1:19094").strip()
 
     return Config(
@@ -128,36 +101,27 @@ def load_config_from_env() -> Config:
         kafka_sasl_mechanism=os.getenv("KAFKA_SASL_MECHANISM", "PLAIN").strip(),
         kafka_sasl_username=os.getenv("KAFKA_SASL_USERNAME", "").strip(),
         kafka_sasl_password=os.getenv("KAFKA_SASL_PASSWORD", "").strip(),
-        kafka_client_id=os.getenv("KAFKA_CLIENT_ID", "oracle-logminer-archivelog-sr-cdc").strip(),
+        kafka_client_id=os.getenv("KAFKA_CLIENT_ID", "oracle-logminer-archivelog-raw").strip(),
         kafka_flush_timeout_sec=int(os.getenv("KAFKA_FLUSH_TIMEOUT_SEC", "30")),
         produce_retry_timeout_sec=int(os.getenv("PRODUCE_RETRY_TIMEOUT_SEC", "60")),
         produce_retry_poll_sec=float(os.getenv("PRODUCE_RETRY_POLL_SEC", "0.2")),
         topic_per_table=str_to_bool(os.getenv("TOPIC_PER_TABLE", "false"), False),
         topic_prefix=os.getenv("TOPIC_PREFIX", "").strip(),
         topic_separator=os.getenv("TOPIC_SEPARATOR", ".").strip() or ".",
-        state_file=os.getenv("STATE_FILE", "./oracle_kafka_state_archivelog_sr_cdc.json").strip(),
+        state_file=os.getenv("STATE_FILE", "./oracle_kafka_state_archivelog_raw.json").strip(),
         start_from_commit_scn=int(os.getenv("START_FROM_SCN", "0") or "0"),
         filter_schemas=tuple(parse_csv_upper(os.getenv("FILTER_SCHEMAS", ""))),
         filter_tables=tuple(parse_csv_upper(os.getenv("FILTER_TABLES", ""))),
         max_rows_per_batch=int(os.getenv("MAX_ROWS_PER_BATCH", "5000")),
         use_fetchmany=str_to_bool(os.getenv("USE_FETCHMANY", "true"), True),
         fetchmany_size=int(os.getenv("FETCHMANY_SIZE", "1000")),
-        cdc_envelope_enabled=str_to_bool(os.getenv("CDC_ENVELOPE_ENABLED", "false"), False),
-        cdc_supported_tables=tuple(parse_csv_upper(os.getenv("CDC_SUPPORTED_TABLES", ""))),
-        cdc_key_mode=os.getenv("CDC_KEY_MODE", "technical").strip().lower(),
-        cdc_sql_parser_backend=os.getenv("CDC_SQL_PARSER_BACKEND", "auto").strip().lower(),
-        schema_registry_url=os.getenv("SCHEMA_REGISTRY_URL", "http://127.0.0.1:18081").strip(),
-        schema_dir=os.getenv("SCHEMA_DIR", "schemas").strip(),
-        schema_auto_register=str_to_bool(os.getenv("SCHEMA_AUTO_REGISTER", "true"), True),
-        schema_use_latest_version=str_to_bool(os.getenv("SCHEMA_USE_LATEST_VERSION", "false"), False),
-        schema_normalize=str_to_bool(os.getenv("SCHEMA_NORMALIZE", "true"), True),
         verbose=str_to_bool(os.getenv("VERBOSE", "true"), True),
         log_first_n_events=int(os.getenv("LOG_FIRST_N_EVENTS", "3")),
     )
 
 
 def validate_config(cfg: Config) -> None:
-    """Проверяет обязательные поля и совместимость ключевых опций."""
+    """Validate required fields and key options."""
     missing: List[str] = []
     if not cfg.oracle_user:
         missing.append("ORACLE_USER")
@@ -167,28 +131,10 @@ def validate_config(cfg: Config) -> None:
         missing.append("ORACLE_DSN")
     if not cfg.kafka_broker:
         missing.append("KAFKA_BROKER or BROKER")
+    if not cfg.kafka_topic:
+        missing.append("KAFKA_TOPIC")
     if missing:
-        # Единая ошибка по всем отсутствующим полям удобнее для first-run setup.
         raise RuntimeError(f"Missing required env vars: {', '.join(missing)}")
 
     if cfg.fetchmany_size <= 0:
         raise RuntimeError("FETCHMANY_SIZE must be > 0")
-    if cfg.cdc_key_mode not in {"pk", "technical"}:
-        raise RuntimeError("CDC_KEY_MODE must be one of: pk, technical")
-    if cfg.cdc_sql_parser_backend not in {"auto", "auto_legacy_first", "legacy_first", "legacy", "sqlglot"}:
-        raise RuntimeError(
-            "CDC_SQL_PARSER_BACKEND must be one of: "
-            "auto, auto_legacy_first, legacy_first, legacy, sqlglot"
-        )
-
-    if not cfg.cdc_envelope_enabled:
-        raise RuntimeError(
-            "oracle-producer-archivelog-sr is CDC-only. "
-            "Set CDC_ENVELOPE_ENABLED=true or run oracle-producer-archivelog-raw."
-        )
-
-    # Эти проверки нужны для CDC + SR пути.
-    if not schema_registry_dependencies_available():
-        raise RuntimeError("Schema Registry dependencies are unavailable in confluent-kafka package")
-    if not cfg.schema_registry_url:
-        raise RuntimeError("SCHEMA_REGISTRY_URL is required when CDC_ENVELOPE_ENABLED=true")
