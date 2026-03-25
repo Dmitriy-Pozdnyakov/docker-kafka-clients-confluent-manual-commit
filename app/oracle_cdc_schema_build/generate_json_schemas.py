@@ -76,31 +76,60 @@ def _key_schema(topic: str) -> Dict:
 
 
 def _value_schema(topic: str) -> Dict:
+    source_schema = {
+        "type": "object",
+        "properties": {
+            "schema": {"type": "string"},
+            "table": {"type": "string"},
+            "commit_scn": {"type": "integer"},
+            "redo_sequence": {"type": "integer"},
+            "rs_id": {"type": "string"},
+            "ssn": {"type": "integer"},
+            "ts_ms": {"type": ["integer", "null"]},
+        },
+        "required": ["schema", "table", "commit_scn", "redo_sequence", "rs_id", "ssn"],
+        "additionalProperties": False,
+    }
+    row_schema = {"type": "object"}
     return {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "title": f"{topic}-value",
         "type": "object",
-        "properties": {
-            "op": {"type": "string", "enum": ["c", "u", "d"]},
-            "source": {
+        "oneOf": [
+            {
                 "type": "object",
                 "properties": {
-                    "schema": {"type": "string"},
-                    "table": {"type": "string"},
-                    "commit_scn": {"type": "integer"},
-                    "redo_sequence": {"type": "integer"},
-                    "rs_id": {"type": "string"},
-                    "ssn": {"type": "integer"},
-                    "ts_ms": {"type": ["integer", "null"]},
+                    "op": {"type": "string", "enum": ["c"]},
+                    "source": source_schema,
+                    "before": {"type": "null"},
+                    "after": row_schema,
                 },
-                "required": ["schema", "table", "commit_scn", "redo_sequence", "rs_id", "ssn"],
+                "required": ["op", "source", "before", "after"],
                 "additionalProperties": False,
             },
-            "before": {"type": ["object", "null"]},
-            "after": {"type": ["object", "null"]},
-        },
-        "required": ["op", "source", "before", "after"],
-        "additionalProperties": False,
+            {
+                "type": "object",
+                "properties": {
+                    "op": {"type": "string", "enum": ["u"]},
+                    "source": source_schema,
+                    "before": row_schema,
+                    "after": row_schema,
+                },
+                "required": ["op", "source", "before", "after"],
+                "additionalProperties": False,
+            },
+            {
+                "type": "object",
+                "properties": {
+                    "op": {"type": "string", "enum": ["d"]},
+                    "source": source_schema,
+                    "before": row_schema,
+                    "after": {"type": "null"},
+                },
+                "required": ["op", "source", "before", "after"],
+                "additionalProperties": False,
+            },
+        ],
     }
 
 

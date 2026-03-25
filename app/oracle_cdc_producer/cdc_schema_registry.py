@@ -338,8 +338,8 @@ def build_cdc_event(row: RowDict, table_meta: TableMeta, cfg: Any) -> Tuple[RowD
     """Строит CDC key/value для SR serialization.
 
     Поддерживает INSERT/UPDATE/DELETE в рамках прототипного парсера.
-    Для сложных SQL/DDL parser может не подойти — тогда runtime-скрипт
-    может сделать fallback в raw-режим (если включено).
+    Для сложных SQL/DDL parser может не подойти — в этом случае
+    исключение поднимается наверх в fail-fast режиме.
     """
     op_code, before, after = parse_cdc_row_images(
         operation=str(row.get("operation") or ""),

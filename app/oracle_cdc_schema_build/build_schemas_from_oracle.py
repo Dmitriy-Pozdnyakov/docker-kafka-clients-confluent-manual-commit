@@ -156,7 +156,7 @@ def _load_table_metadata(conn: oracledb.Connection, owner: str, table: str) -> D
     }
 
 
-def _build_row_object_schema(table_meta: Dict[str, Any]) -> Dict[str, Any]:
+def _build_row_object_schema(table_meta: Dict[str, Any], include_required: bool = True) -> Dict[str, Any]:
     """Строит JSON Schema объект строки таблицы по списку колонок."""
     properties: Dict[str, Any] = {}
     required: List[str] = []
@@ -171,9 +171,49 @@ def _build_row_object_schema(table_meta: Dict[str, Any]) -> Dict[str, Any]:
         "properties": properties,
         "additionalProperties": False,
     }
-    if required:
+    # include_required=False используется для partial row-images (например UPDATE),
+    # где в before/after допустим неполный набор колонок.
+    if include_required and required:
         payload["required"] = required
     return payload
+
+
+def _build_source_object_schema() -> Dict[str, Any]:
+    """Строит source-блок CDC envelope."""
+    return {
+        "type": "object",
+        "properties": {
+            "schema": {"type": "string"},
+            "table": {"type": "string"},
+            "commit_scn": {"type": "integer"},
+            "redo_sequence": {"type": "integer"},
+            "rs_id": {"type": "string"},
+            "ssn": {"type": "integer"},
+            "ts_ms": {"type": ["integer", "null"]},
+        },
+        "required": ["schema", "table", "commit_scn", "redo_sequence", "rs_id", "ssn"],
+        "additionalProperties": False,
+    }
+
+
+def _build_event_branch_schema(
+    op_code: str,
+    source_schema: Dict[str, Any],
+    before_schema: Dict[str, Any],
+    after_schema: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Строит одну op-ветку schema (c/u/d) для root oneOf."""
+    return {
+        "type": "object",
+        "properties": {
+            "op": {"type": "string", "enum": [op_code]},
+            "source": source_schema,
+            "before": before_schema,
+            "after": after_schema,
+        },
+        "required": ["op", "source", "before", "after"],
+        "additionalProperties": False,
+    }
 
 
 def _build_key_schema(topic: str, table_meta: Dict[str, Any], key_mode: str) -> Dict[str, Any]:
@@ -227,32 +267,38 @@ def _build_key_schema(topic: str, table_meta: Dict[str, Any], key_mode: str) -> 
 
 def _build_value_schema(topic: str, table_meta: Dict[str, Any]) -> Dict[str, Any]:
     """Строит value schema (CDC envelope: op/source/before/after)."""
-    row_schema = _build_row_object_schema(table_meta)
+    strict_row_schema = _build_row_object_schema(table_meta, include_required=True)
+    partial_row_schema = _build_row_object_schema(table_meta, include_required=False)
+    source_schema = _build_source_object_schema()
+
+    # Контракт по операциям:
+    # - c (INSERT): before=null, after=strict row image;
+    # - u (UPDATE): before/after partial row images;
+    # - d (DELETE): before=strict row image, after=null.
+    insert_branch = _build_event_branch_schema(
+        op_code="c",
+        source_schema=source_schema,
+        before_schema={"type": "null"},
+        after_schema=strict_row_schema,
+    )
+    update_branch = _build_event_branch_schema(
+        op_code="u",
+        source_schema=source_schema,
+        before_schema=partial_row_schema,
+        after_schema=partial_row_schema,
+    )
+    delete_branch = _build_event_branch_schema(
+        op_code="d",
+        source_schema=source_schema,
+        before_schema=strict_row_schema,
+        after_schema={"type": "null"},
+    )
+
     return {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "title": f"{topic}-value",
         "type": "object",
-        "properties": {
-            "op": {"type": "string", "enum": ["c", "u", "d"]},
-            "source": {
-                "type": "object",
-                "properties": {
-                    "schema": {"type": "string"},
-                    "table": {"type": "string"},
-                    "commit_scn": {"type": "integer"},
-                    "redo_sequence": {"type": "integer"},
-                    "rs_id": {"type": "string"},
-                    "ssn": {"type": "integer"},
-                    "ts_ms": {"type": ["integer", "null"]},
-                },
-                "required": ["schema", "table", "commit_scn", "redo_sequence", "rs_id", "ssn"],
-                "additionalProperties": False,
-            },
-            "before": {"anyOf": [row_schema, {"type": "null"}]},
-            "after": {"anyOf": [row_schema, {"type": "null"}]},
-        },
-        "required": ["op", "source", "before", "after"],
-        "additionalProperties": False,
+        "oneOf": [insert_branch, update_branch, delete_branch],
     }
 
 

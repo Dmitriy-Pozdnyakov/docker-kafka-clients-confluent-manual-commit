@@ -25,3 +25,8 @@
 
 Каталог схем:
 - `schemas/` (корневая папка проекта, в контейнере `/app/schemas`)
+
+Контракт value schema (op-aware `oneOf`):
+- `op="c"` (INSERT): `before=null`, `after=strict` (обязательные `NOT NULL` колонки);
+- `op="u"` (UPDATE): `before/after=partial` (обязательные поля внутри row-image не требуются);
+- `op="d"` (DELETE): `before=strict`, `after=null`.

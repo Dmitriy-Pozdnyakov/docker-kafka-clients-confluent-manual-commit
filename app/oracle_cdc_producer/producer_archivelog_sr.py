@@ -592,7 +592,11 @@ def run_once(cfg: Config) -> Dict[str, Any]:
             # иначе используем общий cfg.kafka_topic.
             topic = _resolve_topic(cfg, row)
 
-            # В strict CDC-only режиме таблицы вне CDC_SUPPORTED_TABLES пропускаем.
+            # Защитная проверка whitelist в runtime:
+            # даже если SQL-фильтр был сгенерирован из CDC_SUPPORTED_TABLES,
+            # этот guard оставляем как safety-net для любых расхождений.
+            #
+            # В текущем режиме политика здесь "skip" (а не fail).
             if not is_cdc_table_enabled(cfg, row):
                 skipped_non_cdc_rows += 1
                 if skipped_non_cdc_rows <= cfg.log_first_n_events:

@@ -1,0 +1,52 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$comment": "Учебный пример ветки oneOf для DELETE (op='d').",
+  "description": "DELETE-ветка требует strict before (включая non-null required поля), а after всегда null.",
+  "type": "object",
+  "properties": {
+    "op": {
+      "type": "string",
+      "enum": ["d"],
+      "description": "Код операции CDC. Здесь фиксированное значение: d (delete)."
+    },
+    "source": {
+      "type": "object",
+      "description": "Технический блок источника события.",
+      "$comment": "required ниже обязателен для каждого события.",
+      "properties": {
+        "schema": { "type": "string", "description": "Oracle owner/schema." },
+        "table": { "type": "string", "description": "Имя таблицы." },
+        "commit_scn": { "type": "integer", "description": "Commit SCN транзакции." },
+        "redo_sequence": { "type": "integer", "description": "Номер redo sequence." },
+        "rs_id": { "type": "string", "description": "Row sequence id из LogMiner." },
+        "ssn": { "type": "integer", "description": "SQL sequence number." },
+        "ts_ms": { "type": ["integer", "null"], "description": "Опциональный timestamp события." }
+      },
+      "required": ["schema", "table", "commit_scn", "redo_sequence", "rs_id", "ssn"],
+      "additionalProperties": false
+    },
+    "before": {
+      "type": "object",
+      "description": "Полный row-image до DELETE.",
+      "$comment": "required ниже перечисляет non-null колонки таблицы; они обязаны присутствовать для op='d'.",
+      "properties": {
+        "EMPLOYEE_ID": { "type": "number", "description": "PK сотрудника." },
+        "FIRST_NAME": { "type": ["string", "null"], "description": "Имя." },
+        "LAST_NAME": { "type": "string", "description": "Фамилия (non-null)." },
+        "EMAIL": { "type": ["string", "null"], "description": "Email." },
+        "HIRE_DATE": { "type": "string", "description": "Дата найма (non-null)." },
+        "SALARY": { "type": ["number", "null"], "description": "Зарплата." },
+        "DEPARTMENT_ID": { "type": ["number", "null"], "description": "ID департамента." },
+        "CREATED_AT": { "type": "string", "description": "Время создания (non-null)." }
+      },
+      "required": ["EMPLOYEE_ID", "LAST_NAME", "HIRE_DATE", "CREATED_AT"],
+      "additionalProperties": false
+    },
+    "after": {
+      "type": "null",
+      "description": "Для DELETE after всегда null (строка удалена)."
+    }
+  },
+  "required": ["op", "source", "before", "after"],
+  "additionalProperties": false
+}

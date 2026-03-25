@@ -1,0 +1,63 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$comment": "Учебный пример ветки oneOf для UPDATE (op='u').",
+  "description": "Главная идея UPDATE-ветки: before/after являются partial row-images. Это значит, что required внутри before/after отсутствует.",
+  "type": "object",
+  "properties": {
+    "op": {
+      "type": "string",
+      "enum": ["u"],
+      "description": "Код операции CDC. Здесь фиксированное значение: u (update)."
+    },
+    "source": {
+      "type": "object",
+      "description": "Технический блок источника события.",
+      "$comment": "required ниже обязателен всегда; additionalProperties=false запрещает неожиданные поля.",
+      "properties": {
+        "schema": { "type": "string", "description": "Oracle owner/schema." },
+        "table": { "type": "string", "description": "Имя таблицы." },
+        "commit_scn": { "type": "integer", "description": "Commit SCN транзакции." },
+        "redo_sequence": { "type": "integer", "description": "Номер redo sequence." },
+        "rs_id": { "type": "string", "description": "Row sequence id из LogMiner." },
+        "ssn": { "type": "integer", "description": "SQL sequence number." },
+        "ts_ms": { "type": ["integer", "null"], "description": "Опциональный timestamp события." }
+      },
+      "required": ["schema", "table", "commit_scn", "redo_sequence", "rs_id", "ssn"],
+      "additionalProperties": false
+    },
+    "before": {
+      "type": "object",
+      "description": "Снимок значений до UPDATE (partial). Может содержать только часть колонок.",
+      "$comment": "Здесь нет required: это сознательно, чтобы частичные UPDATE не падали на schema validation.",
+      "properties": {
+        "EMPLOYEE_ID": { "type": "number", "description": "PK сотрудника." },
+        "FIRST_NAME": { "type": ["string", "null"], "description": "Имя." },
+        "LAST_NAME": { "type": "string", "description": "Фамилия." },
+        "EMAIL": { "type": ["string", "null"], "description": "Email." },
+        "HIRE_DATE": { "type": "string", "description": "Дата найма." },
+        "SALARY": { "type": ["number", "null"], "description": "Зарплата." },
+        "DEPARTMENT_ID": { "type": ["number", "null"], "description": "ID департамента." },
+        "CREATED_AT": { "type": "string", "description": "Время создания." }
+      },
+      "additionalProperties": false
+    },
+    "after": {
+      "type": "object",
+      "description": "Снимок значений после UPDATE (partial). Также может быть неполным.",
+      "$comment": "additionalProperties=false сохраняем, чтобы не пропускать поля, которых нет в metadata таблицы.",
+      "properties": {
+        "EMPLOYEE_ID": { "type": "number", "description": "PK сотрудника." },
+        "FIRST_NAME": { "type": ["string", "null"], "description": "Имя." },
+        "LAST_NAME": { "type": "string", "description": "Фамилия." },
+        "EMAIL": { "type": ["string", "null"], "description": "Email." },
+        "HIRE_DATE": { "type": "string", "description": "Дата найма." },
+        "SALARY": { "type": ["number", "null"], "description": "Зарплата." },
+        "DEPARTMENT_ID": { "type": ["number", "null"], "description": "ID департамента." },
+        "CREATED_AT": { "type": "string", "description": "Время создания." }
+      },
+      "additionalProperties": false
+    }
+  },
+  "required": ["op", "source", "before", "after"],
+  "additionalProperties": false
+}

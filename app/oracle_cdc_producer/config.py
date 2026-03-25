@@ -105,6 +105,29 @@ def parse_csv_upper(raw: str) -> List[str]:
     return result
 
 
+def _split_qualified_table_name(value: str) -> Tuple[str, str]:
+    """Разбирает имя таблицы в формате SCHEMA.TABLE."""
+    parts = str(value or "").strip().upper().split(".", 1)
+    if len(parts) != 2 or not parts[0] or not parts[1]:
+        raise RuntimeError(f"CDC_SUPPORTED_TABLES item must be in SCHEMA.TABLE format: {value!r}")
+    return parts[0], parts[1]
+
+
+def _derive_sql_filters_from_cdc_tables(cdc_tables: Tuple[str, ...]) -> Tuple[Tuple[str, ...], Tuple[str, ...]]:
+    """Строит SQL-фильтры owner/table из единого списка CDC_SUPPORTED_TABLES."""
+    schemas: List[str] = []
+    tables: List[str] = []
+    for item in cdc_tables:
+        # Поддерживаем одну точку настройки (CDC_SUPPORTED_TABLES),
+        # а SQL-фильтры для v$logmnr_contents выводим автоматически.
+        schema_name, table_name = _split_qualified_table_name(item)
+        if schema_name not in schemas:
+            schemas.append(schema_name)
+        if table_name not in tables:
+            tables.append(table_name)
+    return tuple(schemas), tuple(tables)
+
+
 def load_config_from_env() -> Config:
     """Собирает runtime-конфиг из env с безопасными дефолтами."""
     broker = os.getenv("KAFKA_BROKER", "").strip()
@@ -112,6 +135,22 @@ def load_config_from_env() -> Config:
         # BROKER оставлен как legacy alias для обратной совместимости
         # со старыми env-файлами/скриптами.
         broker = os.getenv("BROKER", "127.0.0.1:19092,127.0.0.1:19093,127.0.0.1:19094").strip()
+
+    legacy_filter_schemas = tuple(parse_csv_upper(os.getenv("FILTER_SCHEMAS", "")))
+    legacy_filter_tables = tuple(parse_csv_upper(os.getenv("FILTER_TABLES", "")))
+    if legacy_filter_schemas or legacy_filter_tables:
+        # Fail-fast: не даем запустить producer с двумя источниками правды
+        # для одного и того же списка таблиц.
+        raise RuntimeError(
+            "FILTER_SCHEMAS/FILTER_TABLES are deprecated for oracle-producer-archivelog-sr. "
+            "Use CDC_SUPPORTED_TABLES as the single source of truth."
+        )
+
+    cdc_supported_tables = tuple(parse_csv_upper(os.getenv("CDC_SUPPORTED_TABLES", "")))
+    # Производные SQL-фильтры нужны только для раннего "отсечения" лишних строк
+    # на стороне Oracle. Бизнес-решение по разрешенной таблице остается за
+    # проверкой is_cdc_table_enabled() в runtime.
+    filter_schemas, filter_tables = _derive_sql_filters_from_cdc_tables(cdc_supported_tables)
 
     return Config(
         oracle_user=os.getenv("ORACLE_USER", "").strip(),
@@ -137,13 +176,13 @@ def load_config_from_env() -> Config:
         topic_separator=os.getenv("TOPIC_SEPARATOR", ".").strip() or ".",
         state_file=os.getenv("STATE_FILE", "./oracle_kafka_state_archivelog_sr_cdc.json").strip(),
         start_from_commit_scn=int(os.getenv("START_FROM_SCN", "0") or "0"),
-        filter_schemas=tuple(parse_csv_upper(os.getenv("FILTER_SCHEMAS", ""))),
-        filter_tables=tuple(parse_csv_upper(os.getenv("FILTER_TABLES", ""))),
+        filter_schemas=filter_schemas,
+        filter_tables=filter_tables,
         max_rows_per_batch=int(os.getenv("MAX_ROWS_PER_BATCH", "5000")),
         use_fetchmany=str_to_bool(os.getenv("USE_FETCHMANY", "true"), True),
         fetchmany_size=int(os.getenv("FETCHMANY_SIZE", "1000")),
         cdc_envelope_enabled=str_to_bool(os.getenv("CDC_ENVELOPE_ENABLED", "false"), False),
-        cdc_supported_tables=tuple(parse_csv_upper(os.getenv("CDC_SUPPORTED_TABLES", ""))),
+        cdc_supported_tables=cdc_supported_tables,
         cdc_key_mode=os.getenv("CDC_KEY_MODE", "technical").strip().lower(),
         cdc_sql_parser_backend=os.getenv("CDC_SQL_PARSER_BACKEND", "auto").strip().lower(),
         schema_registry_url=os.getenv("SCHEMA_REGISTRY_URL", "http://127.0.0.1:18081").strip(),

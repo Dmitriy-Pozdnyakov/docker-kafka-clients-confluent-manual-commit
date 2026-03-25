@@ -8,6 +8,8 @@
 Важно:
 - этот producer работает в strict CDC-only режиме (`CDC_ENVELOPE_ENABLED=true`);
 - raw режим вынесен в отдельный модуль `app/oracle_raw_producer`.
+- список таблиц задается в одном месте: `CDC_SUPPORTED_TABLES` (из него автоматически строятся SQL-фильтры чтения).
+- value-schema op-aware: `INSERT/DELETE` ожидают strict row-image, `UPDATE` допускает partial `before/after`.
 
 ## Точка входа и запуск
 
